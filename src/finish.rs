@@ -3,7 +3,9 @@ use crate::config::{
     OmittedVariantRecord, ProcessOptions, ScienceArtifact, TargetGallery, VariantArtifact,
 };
 use crate::crop::{CropRect, crop_image};
-use crate::finish_style::{FinishOptions, ResolvedFinish, apply_finish};
+use crate::finish_style::{
+    FinishOptions, ResolvedFinish, StarMode, apply_finish, apply_finish_with_accelerator,
+};
 use crate::fits::{inspect_fits_header, read_fits_linear};
 use crate::integrate::{TargetIntegrationOutput, build_science_artifacts};
 use crate::register::{detect_stars, robust_median_mad};
@@ -1151,6 +1153,21 @@ fn finish_options_from_resolved(f: ResolvedFinish) -> FinishOptions {
         saturation: Some(f.saturation),
         gamma: Some(f.gamma),
         local_contrast: Some(f.local_contrast),
+        star_mode: f.star_mode,
+        star_blend: (f.star_mode != StarMode::Standard || (f.star_blend - 1.0).abs() > 1e-6)
+            .then_some(f.star_blend),
+    }
+}
+
+fn star_mode_tag(finish: &ResolvedFinish) -> Option<(&'static str, String)> {
+    match finish.star_mode {
+        StarMode::Standard => None,
+        StarMode::Starless => Some(("starless", "Starless".to_string())),
+        StarMode::Reduced => Some((
+            "star-reduced",
+            format!("Star-Reduced {:.0}%", finish.star_blend * 100.0),
+        )),
+        StarMode::StarsOnly => Some(("stars-only", "Stars Only".to_string())),
     }
 }
 
@@ -1278,7 +1295,12 @@ pub fn render_target_gallery(
                     .map(|s| s.total_exposure_s)
                     .sum();
                 let mut stretched = stretch_and_balance_rgb(linear_rgb, &pal_id, None);
-                let finish = apply_finish(&mut stretched, &options.finish)?;
+                let std_finish = FinishOptions {
+                    star_mode: StarMode::Standard,
+                    star_blend: None,
+                    ..options.finish
+                };
+                let finish = apply_finish(&mut stretched, &std_finish)?;
                 let crop = display_crop(&science_integrations, &used_channels, options.trim_edges);
                 let tiff_name = format!("{}-{}.tiff", target_id, pal_id);
                 let png_name = format!("{}-{}.png", target_id, pal_id);
@@ -1401,7 +1423,7 @@ pub fn render_target_gallery(
         })
         .unwrap_or_else(|| variants[0].id.clone());
 
-    let selected_variant = if let Some(req_pal) = &options.palette {
+    let mut selected_variant = if let Some(req_pal) = &options.palette {
         let req_lower = req_pal.to_ascii_lowercase();
         if let Some(found) = variants.iter().find(|v| {
             v.id.eq_ignore_ascii_case(&req_lower) || v.palette.eq_ignore_ascii_case(&req_lower)
@@ -1420,6 +1442,90 @@ pub fn render_target_gallery(
         primary_variant.clone()
     };
 
+    let requested_finish = options.finish.resolve()?;
+    if requested_finish.star_mode != StarMode::Standard {
+        let base_pal = variants
+            .iter()
+            .find(|v| v.id == selected_variant)
+            .map(|v| v.palette.clone())
+            .unwrap_or_else(|| primary_variant.clone());
+        let (mut linear_rgb, used_channels, base_title, base_desc, artistic) =
+            compose_palette_linear(&base_pal, &raw_channels, &norm_channels, mix_spec)?;
+        linear_rgb.exposure = used_science(&science_integrations, &used_channels)
+            .map(|s| s.total_exposure_s)
+            .sum();
+        let stretched_base = stretch_and_balance_rgb(linear_rgb, &base_pal, None);
+        let crop = display_crop(&science_integrations, &used_channels, options.trim_edges);
+        let total_exp: f32 = used_science(&science_integrations, &used_channels)
+            .map(|s| s.total_exposure_s)
+            .sum();
+
+        let mut modes_to_emit = vec![options.finish];
+        if requested_finish.star_mode == StarMode::Starless {
+            modes_to_emit.push(FinishOptions {
+                star_mode: StarMode::StarsOnly,
+                star_blend: Some(1.0),
+                ..options.finish
+            });
+        }
+
+        let mut first_star_variant_id = None;
+        for mode_opts in modes_to_emit {
+            let mut img = stretched_base.clone();
+            let resolved = apply_finish_with_accelerator(&mut img, &mode_opts, options.accelerator)?;
+            let Some((slug, label)) = star_mode_tag(&resolved) else {
+                continue;
+            };
+            let var_id = format!("{}-{}", base_pal, slug);
+            let tiff_name = format!("{}-{}.tiff", target_id, var_id);
+            let png_name = format!("{}-{}.png", target_id, var_id);
+            write_variant_images(&img, &run_dir.join(&tiff_name), &run_dir.join(&png_name))?;
+            let mode_desc = match resolved.star_mode {
+                StarMode::Starless => format!(
+                    "{} Starless nebula separation via multiscale harmonic star inpainting.",
+                    base_desc
+                ),
+                StarMode::Reduced => format!(
+                    "{} Star-separated nebula finish with {:.0}% screen-blended stars.",
+                    base_desc,
+                    resolved.star_blend * 100.0
+                ),
+                StarMode::StarsOnly => format!(
+                    "{} Extracted stars-only layer via unscreen decomposition.",
+                    base_desc
+                ),
+                StarMode::Standard => base_desc.clone(),
+            };
+            let prov = format!(
+                "Channels: {} | Total exposure: {:.1}s | Star mode: {}",
+                used_channels.join("+"),
+                total_exp,
+                label
+            );
+            if first_star_variant_id.is_none() {
+                first_star_variant_id = Some(var_id.clone());
+            }
+            variants.push(VariantArtifact {
+                id: var_id,
+                title: format!("{} ({})", base_title, label),
+                palette: base_pal.clone(),
+                description: mode_desc,
+                artistic_interpretation: artistic || resolved.star_mode != StarMode::Standard,
+                ai_enhanced: false,
+                tiff_path: format!("{run_rel_dir}/{tiff_name}"),
+                png_path: format!("{run_rel_dir}/{png_name}"),
+                channels_used: used_channels.clone(),
+                provenance: prov,
+                restore_info: None,
+                finish: Some(resolved),
+                crop,
+                magic: None,
+            });
+        }
+        if let Some(star_id) = first_star_variant_id {
+            selected_variant = star_id;
+        }
+    }
     Ok(TargetGallery {
         target_id: target_id.to_string(),
         target_label: target_label.to_string(),
@@ -1470,9 +1576,14 @@ pub fn rerender_variant_from_stored_fits(
     if let Some(edits) = edits {
         finish_options.exposure = edits.exposure.or(finish_options.exposure);
         finish_options.saturation = edits.saturation.or(finish_options.saturation);
+        if let Some(sm) = edits.star_mode {
+            finish_options.star_mode = sm;
+        }
+        if edits.star_blend.is_some() {
+            finish_options.star_blend = edits.star_blend;
+        }
     }
     finish_options.resolve()?;
-
     let mut raw_channels = BTreeMap::new();
     for sci in &target.science_integrations {
         let Some(ch) = Channel::from_token(&sci.channel) else {
@@ -1556,10 +1667,16 @@ pub fn rerender_variant_from_stored_fits(
         .map(|s| s.total_exposure_s)
         .sum();
     let mut stretched = stretch_and_balance_rgb(linear_rgb, &base_palette, edits);
-    let finish = apply_finish(&mut stretched, &finish_options)?;
+    let finish = apply_finish_with_accelerator(
+        &mut stretched,
+        &finish_options,
+        crate::config::AcceleratorMode::Auto,
+    )?;
     let crop = display_crop(&target.science_integrations, &used_channels, trim_edges);
 
+    let star_tag = star_mode_tag(&finish);
     let reuse_base = edits.is_none()
+        && star_tag.is_none()
         && variant_suffix.is_some_and(|suffix| {
             clap::ValueEnum::to_possible_value(&finish.preset)
                 .is_some_and(|value| value.get_name() == suffix)
@@ -1570,6 +1687,17 @@ pub fn rerender_variant_from_stored_fits(
         });
     let (var_id, title) = if reuse_base {
         (base_palette.clone(), base_title)
+    } else if let Some((star_slug, star_label)) = star_tag {
+        match variant_suffix {
+            Some(suffix) if suffix != star_slug && suffix != "balanced" && suffix != "edited" => (
+                format!("{}-{}-{}", base_palette, suffix, star_slug),
+                format!("{} ({}, {})", base_title, suffix, star_label),
+            ),
+            _ => (
+                format!("{}-{}", base_palette, star_slug),
+                format!("{} ({})", base_title, star_label),
+            ),
+        }
     } else if let Some(suffix) = variant_suffix {
         (
             format!("{}-{}", base_palette, suffix),
@@ -1578,6 +1706,10 @@ pub fn rerender_variant_from_stored_fits(
     } else {
         (base_palette.clone(), base_title)
     };
+
+    if let Some((_, ref star_label)) = star_mode_tag(&finish) {
+        description = format!("{} Star mode: {}.", description, star_label);
+    }
 
     if let Some(ed) = edits {
         let mut parts = Vec::new();
@@ -1589,6 +1721,9 @@ pub fn rerender_variant_from_stored_fits(
         }
         if let Some(sat) = ed.saturation {
             parts.push(format!("saturation {:.2}x", sat));
+        }
+        if let Some(sm) = ed.star_mode {
+            parts.push(format!("star mode {}", sm.as_str()));
         }
         if !parts.is_empty() {
             description = format!("{} Edited: {}.", description, parts.join(", "));
@@ -1875,6 +2010,12 @@ main { max-width: 1280px; margin: 0 auto; padding: 1.5rem 2rem; }
                     r#"<span class="badge art">Display finish: {:?}</span>"#,
                     finish.preset,
                 ));
+                if let Some((_, star_label)) = star_mode_tag(&finish) {
+                    html.push_str(&format!(
+                        r#"<span class="badge sci">{}</span>"#,
+                        html_escape(&star_label),
+                    ));
+                }
             }
             if let Some(crop) = var.crop {
                 html.push_str(&format!(

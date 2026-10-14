@@ -129,3 +129,59 @@ extern "C" __global__ void stack_tile(const float* values, const unsigned int* m
     output[p] = wsum > 0.0f ? vsum / wsum : mu;
     output_masks[p] = 1;
 }
+
+extern "C" __global__ void starless_diffuse_step(
+    const float* orig_values,
+    const float* src_values,
+    const float* star_mask,
+    const unsigned int* valid_mask,
+    float* dst_values,
+    unsigned int width,
+    unsigned int height,
+    unsigned int channels,
+    unsigned int step
+) {
+    const unsigned int np = width * height;
+    const unsigned int total = np * channels;
+    const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    const unsigned int c = idx / np;
+    const unsigned int p = idx % np;
+    const float orig = orig_values[idx];
+    const float alpha = stack_clamp(star_mask[p], 0.0f, 1.0f);
+    if (valid_mask[p] == 0u || alpha <= 1e-5f) {
+        dst_values[idx] = orig;
+        return;
+    }
+    const int w_i = static_cast<int>(width);
+    const int h_i = static_cast<int>(height);
+    const int x = static_cast<int>(p % width);
+    const int y = static_cast<int>(p / width);
+    const int s = static_cast<int>(step);
+    const unsigned int plane_offset = c * np;
+
+    float sum_v = 0.0f;
+    float sum_w = 0.0f;
+
+    for (int dy = -1; dy <= 1; ++dy) {
+        int ny = y + dy * s;
+        ny = ny < 0 ? 0 : (ny >= h_i ? h_i - 1 : ny);
+        for (int dx = -1; dx <= 1; ++dx) {
+            if (dx == 0 && dy == 0) continue;
+            int nx = x + dx * s;
+            nx = nx < 0 ? 0 : (nx >= w_i ? w_i - 1 : nx);
+            const unsigned int np_idx = static_cast<unsigned int>(ny) * width + static_cast<unsigned int>(nx);
+            if (valid_mask[np_idx] != 0u) {
+                const float w_dir = (dx == 0 || dy == 0) ? 0.15f : 0.10f;
+                const float m_nbr = stack_clamp(star_mask[np_idx], 0.0f, 1.0f);
+                const float w = w_dir * (1.0f - 0.5f * m_nbr);
+                sum_v += w * src_values[plane_offset + np_idx];
+                sum_w += w;
+            }
+        }
+    }
+
+    const float avg = sum_w > 0.0f ? (sum_v / sum_w) : src_values[idx];
+    const float cand = (1.0f - alpha) * orig + alpha * avg;
+    dst_values[idx] = cand < orig ? cand : orig;
+}

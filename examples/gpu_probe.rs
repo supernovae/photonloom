@@ -67,5 +67,48 @@ fn main() -> Result<()> {
             "{frames} frames: safe tile {dim}px, CPU {cpu_ms:.2}ms, GPU {gpu_ms:.2}ms, max difference {error:.6}"
         );
     }
+
+    let (w, h, c) = (256usize, 256usize, 3usize);
+    let np = w * h;
+    let mut orig = vec![0.0f32; np * c];
+    let mut seed = vec![0.0f32; np * c];
+    let mut star_mask = vec![0.0f32; np];
+    let valid_mask = vec![1u32; np];
+    for y in 0..h {
+        for x in 0..w {
+            let p = y * w + x;
+            let r2 = (x as f32 - 128.0).powi(2) + (y as f32 - 128.0).powi(2);
+            let m = (-r2 / 36.0).exp();
+            star_mask[p] = if m > 0.01 { m } else { 0.0 };
+            for ch in 0..c {
+                let bg = 0.12 + 0.03 * (ch as f32) + 0.0005 * (x as f32);
+                let star = 0.80 * (-r2 / 10.0).exp();
+                orig[ch * np + p] = bg + star;
+                seed[ch * np + p] = (1.0 - star_mask[p]) * orig[ch * np + p] + star_mask[p] * bg;
+            }
+        }
+    }
+    let started = Instant::now();
+    let cpu_starless = photonloom::stars::inpaint_starless_tile_cpu(
+        w, h, c, &orig, &seed, &star_mask, &valid_mask,
+    );
+    let cpu_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let started = Instant::now();
+    let gpu_starless = gpu.inpaint_starless_tile(
+        w, h, c, &orig, &seed, &star_mask, &valid_mask,
+    )?;
+    let gpu_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let starless_err = cpu_starless
+        .iter()
+        .zip(&gpu_starless)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    ensure!(
+        starless_err < 1e-4,
+        "Starless CPU/GPU discrepancy: {starless_err}"
+    );
+    println!(
+        "starless 256x256x3 (24 passes): CPU {cpu_ms:.2}ms, GPU {gpu_ms:.2}ms, max difference {starless_err:.6}"
+    );
     Ok(())
 }

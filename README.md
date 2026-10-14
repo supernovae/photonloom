@@ -127,13 +127,18 @@ Re-finish an existing gallery from its stored 32-bit float FITS integrations wit
 cargo run --release -- finish /path/to/gallery \
   --finish-preset dark-nebula --exposure 0.25 --saturation 1.12
 
+# Render a starless nebula variant (or screen-blended star reduction) with GPU offloading
+cargo run --release -- finish /path/to/gallery --starless
+cargo run --release -- finish /path/to/gallery --star-mode reduced --star-blend 0.45
+
 # Render a custom linear channel mix
 cargo run --release -- run /path/to/observations \
   --output /path/to/custom-gallery \
   --mix 'Ha:1,Ha:0.7+OIII:0.3,OIII:1'
 
-# Apply a deterministic natural-language edit without restacking
+# Apply a deterministic natural-language edit (including starless / star reduction) without restacking
 cargo run --release -- edit /path/to/gallery "make the HOO image warmer and brighter"
+cargo run --release -- edit /path/to/gallery "make the SHO image starless"
 ```
 
 | Finish Control | Flag | Range | Notes |
@@ -144,8 +149,9 @@ cargo run --release -- edit /path/to/gallery "make the HOO image warmer and brig
 | **Saturation** | `--saturation` | `0.0` … `1.8` | Hue-preserving gamut-safe saturation |
 | **Midtone Gamma** | `--gamma` | `0.5` … `2.0` | Midtone lift/compression |
 | **Dark-Nebula Detail** | `--local-contrast` | `0.0` … `0.3` | Noise-gated multiscale local contrast that avoids star-halo ringing |
+| **Starless / Star Mode** | `--starless` / `--star-mode` | `standard`, `starless`, `reduced`, `stars-only` | GPU-offloaded (`wgpu` / ROCm `HIP` / `rayon`) 24-pass multiscale harmonic star inpainting & unscreen/screen star separation |
+| **Star Screen Blend** | `--star-blend` | `0.0` … `1.0` | Screen-reblend weight for separated stars (`0.0` = starless, `0.45` = reduced stars, `1.0` = full stars) |
 | **Edge Trimming** | `--keep-edges` | flag (default: trim) | By default, display TIFF/PNGs crop to the common registered overlap while 32-bit FITS retain the full sensor canvas |
-
 ---
 
 ## 🪄 Magic View (Adaptive Measured Finishing)
@@ -158,6 +164,10 @@ photonloom magic view /path/to/gallery \
   --output /path/to/magic-out \
   --palette hoo --variant enhanced --strength 0.5
 
+# Analyze and render a starless nebula Magic View interpretation with GPU offloading
+photonloom magic view /path/to/gallery \
+  --output /path/to/magic-starless \
+  --palette hoo --variant enhanced --strength 0.5 --starless
 # Render another variant/strength from an existing session
 photonloom magic render /path/to/magic-out/magic/<digest>/<target>/session.json \
   --variant dramatic --strength 0.5

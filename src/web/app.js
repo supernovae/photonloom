@@ -80,6 +80,10 @@
   const trimEdgesEl = document.getElementById("trim-edges");
   const finishCropInfo = document.getElementById("finish-crop-info");
   const applyFinishBtn = document.getElementById("apply-finish-btn");
+  const finishStarModeEl = document.getElementById("finish-star-mode");
+  const finishStarBlendWrap = document.getElementById("finish-star-blend-wrap");
+  const finishStarBlendEl = document.getElementById("finish-star-blend");
+  const finishStarBlendVal = document.getElementById("finish-star-blend-value");
   const finishInputs = Object.fromEntries(
     ["exposure", "contrast", "saturation", "gamma", "local_contrast"].map((key) => [
       key,
@@ -97,6 +101,7 @@
   const magicRender = document.getElementById("magic-render");
   const magicStrength = document.getElementById("magic-strength");
   const magicTarget = document.getElementById("magic-target");
+  const magicStarlessEl = document.getElementById("magic-starless");
   const magicCards = document.getElementById("magic-cards");
   const magicEmptyState = document.getElementById("magic-empty-state");
   const magicFeedback = document.getElementById("magic-feedback");
@@ -173,6 +178,11 @@
     magicFeedback.classList.toggle("is-error", Boolean(msg && isError));
   }
 
+  function syncStarBlendVisibility() {
+    if (!finishStarModeEl || !finishStarBlendWrap) return;
+    finishStarBlendWrap.classList.toggle("hidden", finishStarModeEl.value !== "reduced");
+  }
+
   function setFinishValues(recipe) {
     if (!recipe) return;
     finishPresetEl.value = recipe.preset;
@@ -180,14 +190,32 @@
       input.value = recipe[key];
       document.getElementById(`${input.id}-value`).textContent = Number(input.value).toFixed(2);
     }
+    if (finishStarModeEl) {
+      finishStarModeEl.value = recipe.star_mode || "standard";
+      const blend = recipe.star_blend != null ? Number(recipe.star_blend) : 0.45;
+      if (finishStarBlendEl && finishStarBlendVal) {
+        finishStarBlendEl.value = recipe.star_mode === "reduced" ? blend : 0.45;
+        finishStarBlendVal.textContent = Number(finishStarBlendEl.value).toFixed(2);
+      }
+      syncStarBlendVisibility();
+    }
   }
 
   function readFinishValues() {
+    const starMode = finishStarModeEl ? finishStarModeEl.value : "standard";
+    const starBlend =
+      starMode === "starless"
+        ? 0.0
+        : starMode === "reduced" && finishStarBlendEl
+          ? Number(finishStarBlendEl.value)
+          : null;
     return {
       preset: finishPresetEl.value,
       ...Object.fromEntries(
         Object.entries(finishInputs).map(([key, input]) => [key, Number(input.value)])
       ),
+      star_mode: starMode,
+      ...(starBlend !== null ? { star_blend: starBlend } : {}),
     };
   }
 
@@ -222,6 +250,20 @@
     input.addEventListener("input", () => {
       document.getElementById(`${input.id}-value`).textContent = Number(input.value).toFixed(2);
       showFeedback("Unsaved display adjustments — use Apply Finish when ready.");
+    });
+  }
+  if (finishStarModeEl) {
+    finishStarModeEl.addEventListener("change", () => {
+      syncStarBlendVisibility();
+      showFeedback("Star layer mode changed — click Apply Finish to rerender.");
+    });
+  }
+  if (finishStarBlendEl) {
+    finishStarBlendEl.addEventListener("input", () => {
+      if (finishStarBlendVal) {
+        finishStarBlendVal.textContent = Number(finishStarBlendEl.value).toFixed(2);
+      }
+      showFeedback("Star screen-blend weight adjusted — click Apply Finish to rerender.");
     });
   }
 
@@ -371,7 +413,13 @@
     rerenderPaletteEl.replaceChildren();
     for (const v of new Map(
       target.variants
-        .filter((v) => v.palette !== "custom" && !v.magic && !v.restore_info)
+        .filter(
+          (v) =>
+            v.palette !== "custom" &&
+            !v.magic &&
+            !v.restore_info &&
+            (!v.finish || !v.finish.star_mode || v.finish.star_mode === "standard")
+        )
         .map((v) => [v.palette, v])
     ).values()) {
       const option = document.createElement("option");
@@ -414,6 +462,17 @@
         ? `Magic ${variant.magic.variant}`
         : `Magic · ${variant.magic.recipe_id || "Adaptive"}`;
       activeBadges.appendChild(bMag);
+    }
+    if (variant.finish && variant.finish.star_mode && variant.finish.star_mode !== "standard") {
+      const bStar = document.createElement("span");
+      bStar.className = "badge sci";
+      bStar.textContent =
+        variant.finish.star_mode === "starless"
+          ? "Starless Nebula"
+          : variant.finish.star_mode === "stars-only"
+            ? "Stars Only"
+            : `Star-Reduced ${Math.round((variant.finish.star_blend ?? 0.45) * 100)}%`;
+      activeBadges.appendChild(bStar);
     }
     if (variant.artistic_interpretation) {
       const bArt = document.createElement("span");
@@ -498,7 +557,9 @@
           output,
           palette,
           magic_view: document.getElementById("run-magic-view").checked,
-          finish: readFinishValues(),
+          finish: document.getElementById("run-starless")?.checked
+            ? { ...readFinishValues(), star_mode: "starless", star_blend: 0.0 }
+            : readFinishValues(),
           trim_edges: trimEdgesEl.checked,
         }),
       });
@@ -673,6 +734,9 @@
           0.5;
         magicStrength.value = latestStrength;
         document.getElementById("magic-strength-value").textContent = Number(latestStrength).toFixed(2);
+        if (magicStarlessEl) {
+          magicStarlessEl.checked = Boolean(magicSession.starless);
+        }
         magicStatus.textContent = "Loaded saved session";
         displayMagic();
       }
@@ -699,6 +763,7 @@
         v.palette !== "custom" &&
         !v.magic &&
         !v.restore_info &&
+        (!v.finish || !v.finish.star_mode || v.finish.star_mode === "standard") &&
         (!palettes.has(v.palette) || v.id === v.palette)
       ) {
         palettes.set(v.palette, v.title);
@@ -1001,6 +1066,7 @@
       catalog_online: document.getElementById("magic-catalog-online").checked,
       magic_llm: document.getElementById("magic-llm-url").value.trim() || null,
       magic_learn: document.getElementById("magic-learn").checked,
+      starless: Boolean(magicStarlessEl && magicStarlessEl.checked),
     };
   }
 
@@ -1079,6 +1145,15 @@
     if (!magicBusy && magicSession && !chosenCandidate()) magicRefresh.click();
   });
 
+  if (magicStarlessEl) {
+    magicStarlessEl.addEventListener("change", () => {
+      if (!magicBusy && magicSession) {
+        magicRefresh.click();
+      } else {
+        displayMagic();
+      }
+    });
+  }
   magicTarget.addEventListener("change", () => {
     activeTargetId = magicTarget.value;
     magicPalette = "";

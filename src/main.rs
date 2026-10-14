@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::ValueEnum;
 use clap::{Parser, Subcommand};
 use photonloom::config::{AcceleratorMode, ProcessOptions, default_output_for_input};
-use photonloom::finish_style::{FinishOptions, FinishPreset};
+use photonloom::finish_style::{FinishOptions, FinishPreset, StarMode};
 use photonloom::magic::{self, InputDomain, MagicOptions, MagicSource, MagicVariant, TransferFunction};
 use std::path::PathBuf;
 
@@ -24,10 +24,24 @@ struct FinishArgs {
     /// Keep the full display canvas rather than trimming alignment borders
     #[arg(long)]
     keep_edges: bool,
+    /// Remove stars using GPU-offloaded multiscale harmonic star inpainting
+    #[arg(long, default_value_t = false)]
+    starless: bool,
+    /// Star layer separation mode (standard, starless, reduced, stars-only)
+    #[arg(long, value_enum)]
+    star_mode: Option<StarMode>,
+    /// Star screen-reblend weight in [0.0, 1.0] (0.0 = starless, 0.45 = reduced, 1.0 = full stars)
+    #[arg(long)]
+    star_blend: Option<f32>,
 }
 
 impl FinishArgs {
     fn options(&self) -> FinishOptions {
+        let star_mode = if self.starless {
+            StarMode::Starless
+        } else {
+            self.star_mode.unwrap_or(StarMode::Standard)
+        };
         FinishOptions {
             preset: self.finish_preset,
             exposure: self.exposure,
@@ -35,6 +49,8 @@ impl FinishArgs {
             saturation: self.saturation,
             gamma: self.gamma,
             local_contrast: self.local_contrast,
+            star_mode,
+            star_blend: self.star_blend,
         }
     }
 }
@@ -163,6 +179,12 @@ enum MagicAction {
         /// Replay a versioned validated MagicProposal JSON without other tuning flags
         #[arg(long)]
         magic_parameters: Option<PathBuf>,
+        /// Produce starless Magic View candidates via GPU/CPU multiscale harmonic star inpainting
+        #[arg(long, default_value_t = false)]
+        starless: bool,
+        /// Star screen-reblend weight in [0.0, 1.0] for star-separated Magic View finishing
+        #[arg(long)]
+        star_blend: Option<f32>,
     },
     Render {
         session_json: PathBuf,
@@ -222,7 +244,7 @@ fn main() -> Result<()> {
         }
         Commands::Magic { action } => match action {
             MagicAction::View { input, output, target, palette, input_domain, transfer, variant, strength,
-                catalog_online, magic_llm, magic_learn, magic_parameters } => {
+                catalog_online, magic_llm, magic_learn, magic_parameters, starless, star_blend } => {
                 let proposal = magic_parameters.as_deref().map(magic::planner::load_parameters).transpose()?;
                 let requested_strength = proposal.as_ref().map(|p| p.strength).or(strength).unwrap_or(0.5);
                 let requested_variant = proposal.as_ref().map(|p| p.variant).or(variant);
@@ -247,7 +269,8 @@ fn main() -> Result<()> {
                 };
                 let mut session = magic::analyze(&source, &MagicOptions { catalog_online, magic_llm,
                     magic_learn, proposal, planner_strength: requested_strength,
-                    planner_variant: requested_variant.unwrap_or(MagicVariant::Enhanced), ..Default::default() }, &output)?;
+                    planner_variant: requested_variant.unwrap_or(MagicVariant::Enhanced),
+                    starless, star_blend, ..Default::default() }, &output)?;
                 let selected_strength = session.proposal.as_ref().map_or(requested_strength, |p| p.strength);
                 let selected_variant = session.proposal.as_ref().map(|p| p.variant).or(requested_variant);
                 if selected_strength != 0.0 { magic::preview(&mut session, 0.0)?; }

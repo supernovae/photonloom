@@ -5,7 +5,7 @@ use clap::ValueEnum;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::config::LinearImage;
+use crate::config::{AcceleratorMode, LinearImage};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -16,6 +16,28 @@ pub enum FinishPreset {
     Neutral,
     Vivid,
     DarkNebula,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[clap(rename_all = "kebab-case")]
+pub enum StarMode {
+    #[default]
+    Standard,
+    Starless,
+    Reduced,
+    StarsOnly,
+}
+
+impl StarMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Starless => "starless",
+            Self::Reduced => "reduced",
+            Self::StarsOnly => "stars-only",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
@@ -32,6 +54,12 @@ pub struct FinishOptions {
     pub gamma: Option<f32>,
     /// Noise-gated dark detail strength (0 = disabled).
     pub local_contrast: Option<f32>,
+    /// Star layer mode: standard, starless, reduced, or stars-only.
+    #[serde(default)]
+    pub star_mode: StarMode,
+    /// Star screen-reblend weight in [0.0, 1.0] (0.0 = starless, 1.0 = full stars).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub star_blend: Option<f32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -42,6 +70,14 @@ pub struct ResolvedFinish {
     pub saturation: f32,
     pub gamma: f32,
     pub local_contrast: f32,
+    #[serde(default)]
+    pub star_mode: StarMode,
+    #[serde(default = "default_star_blend")]
+    pub star_blend: f32,
+}
+
+const fn default_star_blend() -> f32 {
+    1.0
 }
 
 impl FinishPreset {
@@ -63,6 +99,8 @@ impl FinishPreset {
             saturation,
             gamma,
             local_contrast,
+            star_mode: StarMode::Standard,
+            star_blend: 1.0,
         }
     }
 }
@@ -76,6 +114,7 @@ impl FinishOptions {
             ("saturation", self.saturation, 0.0, 1.8),
             ("gamma", self.gamma, 0.5, 2.0),
             ("local_contrast", self.local_contrast, 0.0, 0.3),
+            ("star_blend", self.star_blend, 0.0, 1.0),
         ] {
             if let Some(v) = value {
                 if !v.is_finite() || !(min..=max).contains(&v) {
@@ -88,6 +127,18 @@ impl FinishOptions {
         resolved.saturation = self.saturation.unwrap_or(resolved.saturation);
         resolved.gamma = self.gamma.unwrap_or(resolved.gamma);
         resolved.local_contrast = self.local_contrast.unwrap_or(resolved.local_contrast);
+        let (star_mode, star_blend) = match (self.star_mode, self.star_blend) {
+            (StarMode::Starless, _) => (StarMode::Starless, 0.0),
+            (StarMode::StarsOnly, _) => (StarMode::StarsOnly, 1.0),
+            (StarMode::Reduced, Some(b)) if b <= 0.0 => (StarMode::Starless, 0.0),
+            (StarMode::Reduced, Some(b)) => (StarMode::Reduced, b),
+            (StarMode::Reduced, None) => (StarMode::Reduced, 0.45),
+            (StarMode::Standard, Some(b)) if b <= 0.0 => (StarMode::Starless, 0.0),
+            (StarMode::Standard, Some(b)) if b < 1.0 => (StarMode::Reduced, b),
+            (StarMode::Standard, _) => (StarMode::Standard, 1.0),
+        };
+        resolved.star_mode = star_mode;
+        resolved.star_blend = star_blend;
         Ok(resolved)
     }
 }
@@ -124,21 +175,55 @@ fn tone(y: f32, params: &ResolvedFinish, exposure: f32, inverse_gamma: f32) -> f
 /// Alter only valid display RGB pixels. The original mask, exposure metadata and dimensions remain intact.
 /// Neutral is an exact no-op, including pixels with out-of-gamut or masked payload values.
 pub fn apply_finish(image: &mut LinearImage, options: &FinishOptions) -> Result<ResolvedFinish> {
+    apply_finish_with_accelerator(image, options, AcceleratorMode::Auto)
+}
+
+/// Applies display finishing with optional GPU-offloaded star separation (`starless`, `reduced`, `stars-only`).
+pub fn apply_finish_with_accelerator(
+    image: &mut LinearImage,
+    options: &FinishOptions,
+    accelerator: AcceleratorMode,
+) -> Result<ResolvedFinish> {
     let params = options.resolve()?;
     let npix = image.width.checked_mul(image.height);
     let expected = npix.and_then(|n| n.checked_mul(3));
     if image.channels != 3 || expected != Some(image.data.len()) || npix != Some(image.mask.len()) {
         bail!("display finishing requires a valid planar RGB image and mask");
     }
+    let npix = npix.unwrap();
+    match params.star_mode {
+        StarMode::Standard => {
+            apply_curves_in_place(image, &params, npix);
+        }
+        StarMode::Starless => {
+            let sep = crate::stars::separate_stars(image, accelerator)?;
+            image.data = sep.starless.data;
+            apply_curves_in_place(image, &params, npix);
+        }
+        StarMode::Reduced => {
+            let sep = crate::stars::separate_stars(image, accelerator)?;
+            image.data = sep.starless.data;
+            apply_curves_in_place(image, &params, npix);
+            crate::stars::screen_blend_stars(image, &sep.stars, params.star_blend);
+        }
+        StarMode::StarsOnly => {
+            let sep = crate::stars::separate_stars(image, accelerator)?;
+            image.data = sep.stars.data;
+            apply_curves_in_place(image, &params, npix);
+        }
+    }
+    Ok(params)
+}
+
+fn apply_curves_in_place(image: &mut LinearImage, params: &ResolvedFinish, npix: usize) {
     if params.exposure == 0.0
         && params.contrast == 1.0
         && params.saturation == 1.0
         && params.gamma == 1.0
         && params.local_contrast == 0.0
     {
-        return Ok(params);
+        return;
     }
-    let npix = npix.unwrap();
     let exposure = 2.0f32.powf(params.exposure);
     let inverse_gamma = 1.0 / params.gamma;
     // Only the optional local operation needs a luminance buffer; no RGB image copies.
@@ -163,7 +248,7 @@ pub fn apply_finish(image: &mut LinearImage, options: &FinishOptions) -> Result<
             }
             let input = y.clamp(0.0, 1.0);
             let local = local_luma.as_ref().map_or(0.0, |correction| correction[i]);
-            let target = (tone(input, &params, exposure, inverse_gamma) - local).clamp(0.0, 1.0);
+            let target = (tone(input, params, exposure, inverse_gamma) - local).clamp(0.0, 1.0);
             // Keep the original hue: adjust luminance once, scale chroma uniformly,
             // then shrink chroma as a group if any channel reaches the RGB gamut edge.
             let chroma_scale = params.saturation * (target / y);
@@ -184,7 +269,7 @@ pub fn apply_finish(image: &mut LinearImage, options: &FinishOptions) -> Result<
             *g = (target + gamut * delta[1]).clamp(0.0, 1.0);
             *b = (target + gamut * delta[2]).clamp(0.0, 1.0);
         });
-    Ok(params)
+    // curves applied in-place
 }
 
 /// Local means are computed using two running-sum box passes (O(pixels)), with

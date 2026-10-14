@@ -194,6 +194,86 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+struct StarlessParams {
+    width: u32,
+    height: u32,
+    channels: u32,
+    step: u32,
+}
+
+const STARLESS_SHADER_WGSL: &str = r#"
+struct StarlessParams {
+    width: u32,
+    height: u32,
+    channels: u32,
+    step: u32,
+}
+
+@group(0) @binding(0) var<uniform> params: StarlessParams;
+@group(0) @binding(1) var<storage, read> orig_values: array<f32>;
+@group(0) @binding(2) var<storage, read> src_values: array<f32>;
+@group(0) @binding(3) var<storage, read> star_mask: array<f32>;
+@group(0) @binding(4) var<storage, read> valid_mask: array<u32>;
+@group(0) @binding(5) var<storage, read_write> dst_values: array<f32>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let np = params.width * params.height;
+    let total = np * params.channels;
+    let idx = gid.x;
+    if (idx >= total) {
+        return;
+    }
+    let c = idx / np;
+    let p = idx % np;
+    let orig = orig_values[idx];
+    let alpha = clamp(star_mask[p], 0.0, 1.0);
+    if (valid_mask[p] == 0u || alpha <= 1e-5) {
+        dst_values[idx] = orig;
+        return;
+    }
+    let w_i = i32(params.width);
+    let h_i = i32(params.height);
+    let x = i32(p % params.width);
+    let y = i32(p / params.width);
+    let s = i32(params.step);
+    let plane_offset = c * np;
+
+    var sum_v = 0.0;
+    var sum_w = 0.0;
+
+    for (var dy = -1; dy <= 1; dy = dy + 1) {
+        let ny = clamp(y + dy * s, 0, h_i - 1);
+        for (var dx = -1; dx <= 1; dx = dx + 1) {
+            if (dx == 0 && dy == 0) {
+                continue;
+            }
+            let nx = clamp(x + dx * s, 0, w_i - 1);
+            let np_idx = u32(ny) * params.width + u32(nx);
+            if (valid_mask[np_idx] != 0u) {
+                var w_dir = 0.10;
+                if (dx == 0 || dy == 0) {
+                    w_dir = 0.15;
+                }
+                let m_nbr = clamp(star_mask[np_idx], 0.0, 1.0);
+                let w = w_dir * (1.0 - 0.5 * m_nbr);
+                sum_v = sum_v + w * src_values[plane_offset + np_idx];
+                sum_w = sum_w + w;
+            }
+        }
+    }
+
+    var avg = src_values[idx];
+    if (sum_w > 0.0) {
+        avg = sum_v / sum_w;
+    }
+    let cand = (1.0 - alpha) * orig + alpha * avg;
+    dst_values[idx] = min(orig, cand);
+}
+"#;
+
 /// Portable hardware compute, with optional native HIP on WSL/ROCm hosts.
 /// ROCm is discovered at runtime and is never required to build Photonloom.
 pub struct GpuStacker {
@@ -272,6 +352,39 @@ impl GpuStacker {
             StackBackend::Hip(gpu) => gpu.integrate_tile(pixels, frames, values, masks, weights),
         }
     }
+
+    pub fn inpaint_starless_tile(
+        &mut self,
+        width: usize,
+        height: usize,
+        channels: usize,
+        orig_values: &[f32],
+        seed_values: &[f32],
+        star_mask: &[f32],
+        valid_mask: &[u32],
+    ) -> Result<Vec<f32>> {
+        match &mut self.backend {
+            StackBackend::Portable(gpu) => gpu.inpaint_starless_tile(
+                width,
+                height,
+                channels,
+                orig_values,
+                seed_values,
+                star_mask,
+                valid_mask,
+            ),
+            #[cfg(target_os = "linux")]
+            StackBackend::Hip(gpu) => gpu.inpaint_starless_tile(
+                width,
+                height,
+                channels,
+                orig_values,
+                seed_values,
+                star_mask,
+                valid_mask,
+            ),
+        }
+    }
 }
 
 struct PortableStacker {
@@ -279,6 +392,8 @@ struct PortableStacker {
     queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
+    starless_pipeline: wgpu::ComputePipeline,
+    starless_bgl: wgpu::BindGroupLayout,
     max_binding_bytes: u64,
     max_workgroups: u32,
     pub adapter_name: String,
@@ -294,6 +409,16 @@ struct PortableStacker {
     out_masks_buf: Option<wgpu::Buffer>,
     readback_values_buf: Option<wgpu::Buffer>,
     readback_masks_buf: Option<wgpu::Buffer>,
+    // Reused starless buffers
+    starless_cap_pixels: usize,
+    starless_cap_channels: usize,
+    starless_params_bufs: Option<[wgpu::Buffer; 3]>,
+    starless_orig_buf: Option<wgpu::Buffer>,
+    starless_ping_buf: Option<wgpu::Buffer>,
+    starless_pong_buf: Option<wgpu::Buffer>,
+    starless_mask_buf: Option<wgpu::Buffer>,
+    starless_valid_buf: Option<wgpu::Buffer>,
+    starless_readback_buf: Option<wgpu::Buffer>,
 }
 
 impl PortableStacker {
@@ -463,11 +588,96 @@ impl PortableStacker {
             cache: None,
         });
 
+        let starless_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("photonloom-starless-wgsl"),
+            source: wgpu::ShaderSource::Wgsl(STARLESS_SHADER_WGSL.into()),
+        });
+        let starless_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("photonloom-starless-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let starless_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("photonloom-starless-pl"),
+            bind_group_layouts: &[&starless_bgl],
+            push_constant_ranges: &[],
+        });
+        let starless_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("photonloom-starless-pipeline"),
+            layout: Some(&starless_pl),
+            module: &starless_shader,
+            entry_point: Some("main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+
         Self {
             device,
             queue,
             pipeline,
             bind_group_layout,
+            starless_pipeline,
+            starless_bgl,
             max_binding_bytes,
             max_workgroups,
             adapter_name,
@@ -482,6 +692,15 @@ impl PortableStacker {
             out_masks_buf: None,
             readback_values_buf: None,
             readback_masks_buf: None,
+            starless_cap_pixels: 0,
+            starless_cap_channels: 0,
+            starless_params_bufs: None,
+            starless_orig_buf: None,
+            starless_ping_buf: None,
+            starless_pong_buf: None,
+            starless_mask_buf: None,
+            starless_valid_buf: None,
+            starless_readback_buf: None,
         }
     }
 
@@ -748,6 +967,224 @@ impl PortableStacker {
 
         Ok((out_vals, out_masks))
     }
+
+    fn ensure_starless_buffers(&mut self, num_pixels: usize, channels: usize) -> Result<()> {
+        if self.starless_params_bufs.is_some()
+            && num_pixels <= self.starless_cap_pixels
+            && channels <= self.starless_cap_channels
+        {
+            return Ok(());
+        }
+        let total_bytes = (num_pixels as u64) * (channels as u64) * 4;
+        let mask_bytes = (num_pixels as u64) * 4;
+        self.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let make_param = |label| {
+            self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: std::mem::size_of::<StarlessParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
+        self.starless_params_bufs = Some([
+            make_param("starless_params_s4"),
+            make_param("starless_params_s2"),
+            make_param("starless_params_s1"),
+        ]);
+        self.starless_orig_buf = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("starless_orig_buf"),
+            size: total_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }));
+        self.starless_ping_buf = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("starless_ping_buf"),
+            size: total_bytes,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        }));
+        self.starless_pong_buf = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("starless_pong_buf"),
+            size: total_bytes,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        }));
+        self.starless_mask_buf = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("starless_mask_buf"),
+            size: mask_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }));
+        self.starless_valid_buf = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("starless_valid_buf"),
+            size: mask_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }));
+        self.starless_readback_buf = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("starless_readback_buf"),
+            size: total_bytes,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }));
+        if let Some(error) = pollster::block_on(self.device.pop_error_scope()) {
+            self.starless_params_bufs = None;
+            self.starless_cap_pixels = 0;
+            self.starless_cap_channels = 0;
+            bail!("GPU starless buffer allocation failed: {error}");
+        }
+        self.starless_cap_pixels = num_pixels;
+        self.starless_cap_channels = channels;
+        Ok(())
+    }
+
+    pub fn inpaint_starless_tile(
+        &mut self,
+        width: usize,
+        height: usize,
+        channels: usize,
+        orig_values: &[f32],
+        seed_values: &[f32],
+        star_mask: &[f32],
+        valid_mask: &[u32],
+    ) -> Result<Vec<f32>> {
+        let np = width.checked_mul(height).context("GPU starless tile dimensions overflow")?;
+        let total = np.checked_mul(channels).context("GPU starless channel size overflow")?;
+        if channels == 0 || orig_values.len() != total || seed_values.len() != total
+            || star_mask.len() != np || valid_mask.len() != np
+        {
+            bail!("GPU starless tile inputs have invalid dimensions or lengths");
+        }
+        if np == 0 {
+            return Ok(Vec::new());
+        }
+        let total_bytes = (total as u64) * 4;
+        if total > u32::MAX as usize
+            || total_bytes > self.max_binding_bytes
+            || total_bytes * 4 > TILE_WORKING_SET_BYTES
+            || (total as u64).div_ceil(64) > u64::from(self.max_workgroups)
+        {
+            bail!("GPU starless tile exceeds device binding or dispatch limits");
+        }
+        self.ensure_starless_buffers(np, channels)?;
+
+        let params_bufs = self.starless_params_bufs.as_ref().unwrap();
+        let orig_buf = self.starless_orig_buf.as_ref().unwrap();
+        let ping_buf = self.starless_ping_buf.as_ref().unwrap();
+        let pong_buf = self.starless_pong_buf.as_ref().unwrap();
+        let mask_buf = self.starless_mask_buf.as_ref().unwrap();
+        let valid_buf = self.starless_valid_buf.as_ref().unwrap();
+        let rb_buf = self.starless_readback_buf.as_ref().unwrap();
+
+        for (idx, step) in [4u32, 2u32, 1u32].into_iter().enumerate() {
+            let p = StarlessParams {
+                width: width as u32,
+                height: height as u32,
+                channels: channels as u32,
+                step,
+            };
+            self.queue
+                .write_buffer(&params_bufs[idx], 0, bytemuck::bytes_of(&p));
+        }
+        self.queue
+            .write_buffer(orig_buf, 0, bytemuck::cast_slice(orig_values));
+        self.queue
+            .write_buffer(ping_buf, 0, bytemuck::cast_slice(seed_values));
+        self.queue
+            .write_buffer(mask_buf, 0, bytemuck::cast_slice(star_mask));
+        self.queue
+            .write_buffer(valid_buf, 0, bytemuck::cast_slice(valid_mask));
+
+        let make_bg = |param_buf: &wgpu::Buffer, src: &wgpu::Buffer, dst: &wgpu::Buffer| {
+            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("photonloom-starless-bg"),
+                layout: &self.starless_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: param_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: orig_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: src.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: mask_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: valid_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: dst.as_entire_binding(),
+                    },
+                ],
+            })
+        };
+
+        let bg_a_to_b = [
+            make_bg(&params_bufs[0], ping_buf, pong_buf),
+            make_bg(&params_bufs[1], ping_buf, pong_buf),
+            make_bg(&params_bufs[2], ping_buf, pong_buf),
+        ];
+        let bg_b_to_a = [
+            make_bg(&params_bufs[0], pong_buf, ping_buf),
+            make_bg(&params_bufs[1], pong_buf, ping_buf),
+            make_bg(&params_bufs[2], pong_buf, ping_buf),
+        ];
+
+        let workgroups = (total as u32).div_ceil(64);
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("photonloom-starless-enc"),
+            });
+        for (iter, &step) in crate::stars::STARLESS_DIFFUSION_STEPS.iter().enumerate() {
+            let step_idx = match step {
+                4 => 0,
+                2 => 1,
+                _ => 2,
+            };
+            let bg = if iter % 2 == 0 {
+                &bg_a_to_b[step_idx]
+            } else {
+                &bg_b_to_a[step_idx]
+            };
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("photonloom-starless-pass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.starless_pipeline);
+            cpass.set_bind_group(0, bg, &[]);
+            cpass.dispatch_workgroups(workgroups, 1, 1);
+        }
+        encoder.copy_buffer_to_buffer(ping_buf, 0, rb_buf, 0, total_bytes);
+        self.queue.submit(Some(encoder.finish()));
+
+        let slice = rb_buf.slice(0..total_bytes);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = tx.send(res);
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+        rx.recv()
+            .context("GPU starless readback channel closed")?
+            .context("Failed to map GPU starless output buffer")?;
+        let out: Vec<f32> = {
+            let view = slice.get_mapped_range();
+            bytemuck::cast_slice(&view).to_vec()
+        };
+        rb_buf.unmap();
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -901,6 +1338,87 @@ mod tests {
             assert!(
                 (actual.0[6] + 42.0).abs() < 0.002,
                 "negative outlier rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn vulkan_software_starless_shader_matches_cpu() {
+        let backends = wgpu::Backends::VULKAN;
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends,
+            ..Default::default()
+        });
+        let adapters = instance.enumerate_adapters(backends);
+        let software = adapters.into_iter().filter(|adapter| {
+            let info = adapter.get_info();
+            info.backend == wgpu::Backend::Vulkan && info.device_type == wgpu::DeviceType::Cpu
+        });
+        let mut stacker = None;
+        for adapter in software {
+            let info = adapter.get_info();
+            let mut limits = wgpu::Limits::default();
+            let supported = adapter.limits();
+            limits.max_storage_buffer_binding_size = supported.max_storage_buffer_binding_size;
+            limits.max_buffer_size = supported.max_buffer_size;
+            if let Ok((device, queue)) = pollster::block_on(adapter.request_device(
+                &wgpu::DeviceDescriptor {
+                    label: Some("photonloom-test-software-vulkan-starless"),
+                    required_features: wgpu::Features::empty(),
+                    required_limits: limits,
+                    memory_hints: wgpu::MemoryHints::Performance,
+                },
+                None,
+            )) {
+                let actual = device.limits();
+                let max_binding_bytes = u64::from(actual.max_storage_buffer_binding_size)
+                    .min(actual.max_buffer_size);
+                stacker = Some(PortableStacker::from_device(
+                    device,
+                    queue,
+                    info.name,
+                    max_binding_bytes,
+                ));
+                break;
+            }
+        }
+        let Some(mut stacker) = stacker else {
+            return;
+        };
+
+        let (w, h, c) = (32usize, 32usize, 3usize);
+        let np = w * h;
+        let mut orig = vec![0.0f32; np * c];
+        let mut seed = vec![0.0f32; np * c];
+        let mut star_mask = vec![0.0f32; np];
+        let valid_mask = vec![1u32; np];
+
+        for y in 0..h {
+            for x in 0..w {
+                let p = y * w + x;
+                let r2 = (x as f32 - 16.0).powi(2) + (y as f32 - 16.0).powi(2);
+                let m = (-r2 / 18.0).exp();
+                star_mask[p] = if m > 0.02 { m } else { 0.0 };
+                for ch in 0..c {
+                    let bg = 0.15 + 0.04 * (ch as f32) + 0.002 * (x as f32) + 0.001 * (y as f32);
+                    let star = 0.75 * (-r2 / 6.0).exp();
+                    orig[ch * np + p] = bg + star;
+                    seed[ch * np + p] = (1.0 - star_mask[p]) * orig[ch * np + p] + star_mask[p] * bg;
+                }
+            }
+        }
+
+        let cpu = crate::stars::inpaint_starless_tile_cpu(
+            w, h, c, &orig, &seed, &star_mask, &valid_mask,
+        );
+        let gpu = stacker
+            .inpaint_starless_tile(w, h, c, &orig, &seed, &star_mask, &valid_mask)
+            .expect("Vulkan starless dispatch");
+        assert_eq!(cpu.len(), gpu.len());
+        for (idx, (&a, &b)) in cpu.iter().zip(gpu.iter()).enumerate() {
+            assert!(
+                (a - b).abs() <= 1e-4,
+                "Starless mismatch at {idx}: cpu={a}, gpu={b}"
             );
         }
     }

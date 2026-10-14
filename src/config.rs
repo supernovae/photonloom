@@ -1,5 +1,5 @@
 use crate::crop::CropRect;
-use crate::finish_style::{FinishOptions, ResolvedFinish};
+use crate::finish_style::{FinishOptions, ResolvedFinish, StarMode};
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
@@ -537,6 +537,10 @@ pub struct EditParameters {
     pub exposure: Option<f32>,
     pub saturation: Option<f32>,
     pub temperature: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub star_mode: Option<StarMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub star_blend: Option<f32>,
 }
 
 impl EditParameters {
@@ -578,10 +582,20 @@ impl EditParameters {
                 );
             }
         }
+        if let Some(sb) = self.star_blend {
+            if !sb.is_finite() || !(0.0..=1.0).contains(&sb) {
+                bail!(
+                    "Edit star_blend {} is out of bounds: must be finite in [0.0, 1.0]",
+                    sb
+                );
+            }
+        }
         if self.palette.is_none()
             && self.exposure.is_none()
             && self.saturation.is_none()
             && self.temperature.is_none()
+            && self.star_mode.is_none()
+            && self.star_blend.is_none()
         {
             bail!("Edit specification did not contain any valid adjustments");
         }

@@ -263,16 +263,50 @@ impl Buffers {
     }
 }
 
+struct StarlessBuffers {
+    orig: Buffer,
+    ping: Buffer,
+    pong: Buffer,
+    star_mask: Buffer,
+    valid_mask: Buffer,
+    pixels: usize,
+    channels: usize,
+}
+impl StarlessBuffers {
+    fn new(api: &Api, pixels: usize, channels: usize) -> Result<Self> {
+        let total_bytes = pixels
+            .checked_mul(channels)
+            .and_then(|n| n.checked_mul(4))
+            .context("HIP starless buffer size overflow")?;
+        let mask_bytes = pixels
+            .checked_mul(4)
+            .context("HIP starless mask size overflow")?;
+        Ok(Self {
+            orig: Buffer::new(api, total_bytes)?,
+            ping: Buffer::new(api, total_bytes)?,
+            pong: Buffer::new(api, total_bytes)?,
+            star_mask: Buffer::new(api, mask_bytes)?,
+            valid_mask: Buffer::new(api, mask_bytes)?,
+            pixels,
+            channels,
+        })
+    }
+}
+
 pub(crate) struct HipStacker {
     // Drop buffers and module before the shared libraries (explicit Drop below).
     buffers: Option<Buffers>,
+    starless_buffers: Option<StarlessBuffers>,
     module: Handle,
     kernel: Handle,
+    starless_kernel: Handle,
     api: &'static Api,
     budget: usize,
     pub(crate) adapter_name: String,
 }
 
+// SAFETY: All HIP calls bind device 0 before touching device resources and synchronize before returning.
+unsafe impl Send for HipStacker {}
 impl HipStacker {
     pub(crate) fn try_new() -> Result<Self> {
         let api = Api::load()?;
@@ -385,8 +419,10 @@ impl HipStacker {
         // Guard module immediately: if lookup fails, Drop must unload it.
         let mut stacker = Self {
             buffers: None,
+            starless_buffers: None,
             module,
             kernel: ptr::null_mut(),
+            starless_kernel: ptr::null_mut(),
             api,
             budget,
             adapter_name: format!("AMD HIP: {device_name}"),
@@ -399,7 +435,17 @@ impl HipStacker {
                     c"stack_tile".as_ptr(),
                 )
             },
-            "hipModuleGetFunction",
+            "hipModuleGetFunction (stack_tile)",
+        )?;
+        stacker.api.check(
+            unsafe {
+                (stacker.api.module_function)(
+                    &mut stacker.starless_kernel,
+                    stacker.module,
+                    c"starless_diffuse_step".as_ptr(),
+                )
+            },
+            "hipModuleGetFunction (starless_diffuse_step)",
         )?;
         Ok(stacker)
     }
@@ -562,6 +608,112 @@ impl HipStacker {
             out_masks.into_iter().map(|m| u8::from(m != 0)).collect(),
         ))
     }
+
+    pub(crate) fn inpaint_starless_tile(
+        &mut self,
+        width: usize,
+        height: usize,
+        channels: usize,
+        orig_values: &[f32],
+        seed_values: &[f32],
+        star_mask: &[f32],
+        valid_mask: &[u32],
+    ) -> Result<Vec<f32>> {
+        let np = width.checked_mul(height).context("HIP starless tile dimensions overflow")?;
+        let total = np.checked_mul(channels).context("HIP starless channel length overflow")?;
+        if channels == 0 || orig_values.len() != total || seed_values.len() != total
+            || star_mask.len() != np || valid_mask.len() != np
+        {
+            bail!("HIP starless tile inputs have invalid dimensions or lengths");
+        }
+        if np == 0 {
+            return Ok(Vec::new());
+        }
+        let required_bytes = total
+            .checked_mul(12)
+            .and_then(|n| n.checked_add(np.checked_mul(8)?))
+            .context("HIP starless working set overflow")?;
+        if required_bytes > self.budget || total > u32::MAX as usize {
+            bail!("HIP starless tile exceeds device memory budget");
+        }
+        self.api
+            .check(unsafe { (self.api.set_device)(0) }, "hipSetDevice")?;
+        if self
+            .starless_buffers
+            .as_ref()
+            .is_none_or(|b| b.pixels < np || b.channels < channels)
+        {
+            self.starless_buffers = None;
+            self.starless_buffers = Some(StarlessBuffers::new(&self.api, np, channels)?);
+        }
+        let b = self.starless_buffers.as_ref().expect("HIP starless buffers allocated");
+        let total_bytes = total * 4;
+        let mask_bytes = np * 4;
+        for (dst, src, len, label) in [
+            (b.orig.ptr, orig_values.as_ptr().cast(), total_bytes, "HIP starless orig upload"),
+            (b.ping.ptr, seed_values.as_ptr().cast(), total_bytes, "HIP starless seed upload"),
+            (b.star_mask.ptr, star_mask.as_ptr().cast(), mask_bytes, "HIP starless mask upload"),
+            (b.valid_mask.ptr, valid_mask.as_ptr().cast(), mask_bytes, "HIP starless valid upload"),
+        ] {
+            self.api
+                .check(unsafe { (self.api.memcpy)(dst, src, len, 1) }, label)?;
+        }
+        let blocks = u32::try_from(total.div_ceil(THREADS))
+            .context("HIP starless dispatch exceeds u32 workgroups")?;
+        let mut arg_orig = b.orig.ptr;
+        let mut arg_star_mask = b.star_mask.ptr;
+        let mut arg_valid_mask = b.valid_mask.ptr;
+        let mut arg_w = width as u32;
+        let mut arg_h = height as u32;
+        let mut arg_c = channels as u32;
+        for (iter, &step) in crate::stars::STARLESS_DIFFUSION_STEPS.iter().enumerate() {
+            let (mut arg_src, mut arg_dst) = if iter % 2 == 0 {
+                (b.ping.ptr, b.pong.ptr)
+            } else {
+                (b.pong.ptr, b.ping.ptr)
+            };
+            let mut arg_step = step;
+            let mut args: [*mut c_void; 9] = [
+                (&mut arg_orig as *mut DevicePtr).cast(),
+                (&mut arg_src as *mut DevicePtr).cast(),
+                (&mut arg_star_mask as *mut DevicePtr).cast(),
+                (&mut arg_valid_mask as *mut DevicePtr).cast(),
+                (&mut arg_dst as *mut DevicePtr).cast(),
+                (&mut arg_w as *mut u32).cast(),
+                (&mut arg_h as *mut u32).cast(),
+                (&mut arg_c as *mut u32).cast(),
+                (&mut arg_step as *mut u32).cast(),
+            ];
+            self.api.check(
+                unsafe {
+                    (self.api.launch)(
+                        self.starless_kernel,
+                        blocks,
+                        1,
+                        1,
+                        THREADS as u32,
+                        1,
+                        1,
+                        0,
+                        ptr::null_mut(),
+                        args.as_mut_ptr(),
+                        ptr::null_mut(),
+                    )
+                },
+                "hipModuleLaunchKernel (starless_diffuse_step)",
+            )?;
+        }
+        self.api.check(
+            unsafe { (self.api.synchronize)() },
+            "hipDeviceSynchronize (starless_diffuse_step)",
+        )?;
+        let mut out = vec![0.0f32; total];
+        self.api.check(
+            unsafe { (self.api.memcpy)(out.as_mut_ptr().cast(), b.ping.ptr, total_bytes, 2) },
+            "HIP starless readback",
+        )?;
+        Ok(out)
+    }
 }
 
 impl Drop for HipStacker {
@@ -572,6 +724,7 @@ impl Drop for HipStacker {
             (self.api.set_device)(0);
         }
         self.buffers = None;
+        self.starless_buffers = None;
         if !self.module.is_null() {
             unsafe {
                 (self.api.module_unload)(self.module);

@@ -1,4 +1,5 @@
 use crate::config::{EditParameters, GalleryManifest, RestoreMetadata, VariantArtifact};
+use crate::finish_style::StarMode;
 use crate::finish::rerender_variant_from_stored_fits;
 use anyhow::{Context, Result, bail};
 use directories::ProjectDirs;
@@ -396,6 +397,45 @@ pub fn parse_deterministic_edit(
         params.saturation = Some(if is_slight { 0.80 } else { 0.65 });
     }
 
+
+    // Star mode / star separation grammar
+    if contains_word_or_phrase(&lower, "starless")
+        || contains_word_or_phrase(&lower, "without stars")
+        || contains_word_or_phrase(&lower, "no stars")
+        || contains_word_or_phrase(&lower, "remove stars")
+        || contains_word_or_phrase(&lower, "remove the stars")
+    {
+        params.star_mode = Some(StarMode::Starless);
+        params.star_blend = Some(0.0);
+    } else if contains_word_or_phrase(&lower, "stars only")
+        || contains_word_or_phrase(&lower, "only stars")
+    {
+        params.star_mode = Some(StarMode::StarsOnly);
+        params.star_blend = Some(1.0);
+    } else if contains_word_or_phrase(&lower, "reduce stars")
+        || contains_word_or_phrase(&lower, "reduce the stars")
+        || contains_word_or_phrase(&lower, "smaller stars")
+        || contains_word_or_phrase(&lower, "fewer stars")
+        || contains_word_or_phrase(&lower, "less stars")
+        || contains_word_or_phrase(&lower, "dim stars")
+        || contains_word_or_phrase(&lower, "subdue stars")
+    {
+        params.star_mode = Some(StarMode::Reduced);
+        params.star_blend = Some(if is_slight {
+            0.65
+        } else if is_strong {
+            0.25
+        } else {
+            0.45
+        });
+    } else if contains_word_or_phrase(&lower, "restore stars")
+        || contains_word_or_phrase(&lower, "add stars")
+        || contains_word_or_phrase(&lower, "keep stars")
+        || contains_word_or_phrase(&lower, "with stars")
+    {
+        params.star_mode = Some(StarMode::Standard);
+        params.star_blend = Some(1.0);
+    }
     // Check for unrecognized words outside the documented deterministic grammar
     let allowed_vocab = [
         "make",
@@ -459,6 +499,22 @@ pub fn parse_deterministic_edit(
         "custom",
         "please",
         "it",
+        "starless",
+        "star",
+        "stars",
+        "remove",
+        "without",
+        "no",
+        "reduce",
+        "smaller",
+        "fewer",
+        "dim",
+        "subdue",
+        "only",
+        "add",
+        "keep",
+        "restore",
+        "from",
     ];
     for token in lower.split(|c: char| !c.is_ascii_alphanumeric()) {
         if token.is_empty() {
@@ -604,6 +660,10 @@ If the request is unsupported or asks for something outside these parameters, re
         exposure: Option<f32>,
         saturation: Option<f32>,
         temperature: Option<f32>,
+        #[serde(default)]
+        star_mode: Option<StarMode>,
+        #[serde(default)]
+        star_blend: Option<f32>,
     }
 
     let raw: RawLlmEdit = serde_json::from_str(json_slice).with_context(|| {
@@ -618,6 +678,8 @@ If the request is unsupported or asks for something outside these parameters, re
         exposure: raw.exposure,
         saturation: raw.saturation,
         temperature: raw.temperature,
+        star_mode: raw.star_mode,
+        star_blend: raw.star_blend,
     };
     params.validate(available_palettes)?;
     Ok(params)

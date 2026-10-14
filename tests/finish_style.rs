@@ -1,5 +1,5 @@
 use photonloom::config::LinearImage;
-use photonloom::finish_style::{FinishOptions, FinishPreset, apply_finish};
+use photonloom::finish_style::{FinishOptions, FinishPreset, StarMode, apply_finish};
 
 fn gray_image(width: usize, height: usize, value: f32) -> LinearImage {
     let mut image = LinearImage::new(width, height, 3);
@@ -226,6 +226,18 @@ fn invalid_knobs_reject_nan_infinity_and_out_of_range_before_touching_pixels() {
             exposure: Some(4.01),
             ..Default::default()
         },
+        FinishOptions {
+            star_blend: Some(-0.01),
+            ..Default::default()
+        },
+        FinishOptions {
+            star_blend: Some(1.01),
+            ..Default::default()
+        },
+        FinishOptions {
+            star_blend: Some(f32::NAN),
+            ..Default::default()
+        },
     ];
     for options in invalid {
         let mut image = gray_image(2, 2, 0.25);
@@ -233,4 +245,89 @@ fn invalid_knobs_reject_nan_infinity_and_out_of_range_before_touching_pixels() {
         assert!(apply_finish(&mut image, &options).is_err());
         assert_eq!(image.data, before);
     }
+}
+
+#[test]
+fn starless_reduced_and_stars_only_modes_separate_stars_while_preserving_nebula() {
+    let (w, h) = (96usize, 96usize);
+    let mut scene = LinearImage::new(w, h, 3);
+    let star_centers = [(24.0f32, 24.0f32, 0.72f32), (68.0, 32.0, 0.65), (48.0, 70.0, 0.80)];
+    for y in 0..h {
+        for x in 0..w {
+            let xf = x as f32;
+            let yf = y as f32;
+            let neb = 0.14 + 0.10 * (-((xf - 48.0).powi(2) + (yf - 48.0).powi(2)) / 900.0).exp();
+            let mut star = 0.0f32;
+            for &(sx, sy, amp) in &star_centers {
+                let r2 = (xf - sx).powi(2) + (yf - sy).powi(2);
+                if r2 <= 36.0 {
+                    star += amp * (-r2 / (2.0 * 1.35 * 1.35)).exp();
+                }
+            }
+            scene.set(0, x, y, (neb * 1.15 + star).clamp(0.0, 1.0));
+            scene.set(1, x, y, (neb * 0.95 + star).clamp(0.0, 1.0));
+            scene.set(2, x, y, (neb * 0.85 + star).clamp(0.0, 1.0));
+        }
+    }
+
+    let mut starless_img = scene.clone();
+    let res_starless = apply_finish(
+        &mut starless_img,
+        &FinishOptions {
+            preset: FinishPreset::Neutral,
+            star_mode: StarMode::Starless,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(res_starless.star_mode, StarMode::Starless);
+    assert_eq!(res_starless.star_blend, 0.0);
+
+    let mut reduced_img = scene.clone();
+    let res_reduced = apply_finish(
+        &mut reduced_img,
+        &FinishOptions {
+            preset: FinishPreset::Neutral,
+            star_mode: StarMode::Reduced,
+            star_blend: Some(0.45),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(res_reduced.star_mode, StarMode::Reduced);
+    assert!((res_reduced.star_blend - 0.45).abs() < 1e-6);
+
+    let mut stars_only_img = scene.clone();
+    let res_stars = apply_finish(
+        &mut stars_only_img,
+        &FinishOptions {
+            preset: FinishPreset::Neutral,
+            star_mode: StarMode::StarsOnly,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(res_stars.star_mode, StarMode::StarsOnly);
+
+    // At each star center: starless < reduced < original, and stars_only has strong positive signal
+    for &(sx, sy, _) in &star_centers {
+        let (ix, iy) = (sx as usize, sy as usize);
+        let orig_v = scene.get(0, ix, iy);
+        let sl_v = starless_img.get(0, ix, iy);
+        let red_v = reduced_img.get(0, ix, iy);
+        let st_v = stars_only_img.get(0, ix, iy);
+        assert!(
+            sl_v < orig_v - 0.40,
+            "Star at ({ix},{iy}) was not removed: orig={orig_v}, starless={sl_v}"
+        );
+        assert!(
+            sl_v < red_v && red_v < orig_v,
+            "Expected starless ({sl_v}) < reduced ({red_v}) < original ({orig_v})"
+        );
+        assert!(st_v > 0.45, "Stars-only layer missing star at ({ix},{iy}): {st_v}");
+    }
+
+    // Away from stars (e.g. central nebula at (48, 48)): nebula is untouched in starless & zero in stars-only
+    assert!((starless_img.get(0, 48, 48) - scene.get(0, 48, 48)).abs() < 1e-6);
+    assert!(stars_only_img.get(0, 48, 48) < 1e-5);
 }

@@ -47,11 +47,28 @@ pub struct MagicOptions {
     pub proposal: Option<planner::MagicProposal>,
     pub planner_variant: MagicVariant,
     pub planner_strength: f32,
+    #[serde(default)]
+    pub starless: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub star_blend: Option<f32>,
 }
 impl Default for MagicOptions {
     fn default() -> Self {
         Self { crop: true, catalog_online: false, magic_llm: None, magic_learn: false, proposal: None,
-            planner_variant: MagicVariant::Enhanced, planner_strength: 0.5 }
+            planner_variant: MagicVariant::Enhanced, planner_strength: 0.5, starless: false, star_blend: None }
+    }
+}
+
+pub fn effective_star_blend(starless: bool, star_blend: Option<f32>) -> Result<Option<f32>> {
+    if let Some(b) = star_blend {
+        ensure!(b.is_finite() && (0.0..=1.0).contains(&b), "Magic star_blend must be finite and in [0, 1]");
+    }
+    if starless {
+        Ok(Some(0.0))
+    } else if let Some(b) = star_blend {
+        if b < 1.0 { Ok(Some(b)) } else { Ok(None) }
+    } else {
+        Ok(None)
     }
 }
 
@@ -122,6 +139,10 @@ pub struct MagicSession {
     pub preference_prior: Option<f32>,
     #[serde(default)]
     pub preference_variant: Option<MagicVariant>,
+    #[serde(default)]
+    pub starless: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub star_blend: Option<f32>,
     pub analysis: analysis::ImageAnalysis,
     pub previews: Vec<MagicCandidate>,
     pub artifacts: Vec<VariantArtifact>,
@@ -142,6 +163,7 @@ fn loaded(session: &MagicSession) -> Result<source::PreviewSource> {
 }
 pub fn analyze(source: &MagicSource, options: &MagicOptions, output: &Path) -> Result<MagicSession> {
     sane_strength(options.planner_strength)?;
+    let _ = effective_star_blend(options.starless, options.star_blend)?;
     ensure!(options.proposal.is_none() || (options.magic_llm.is_none() && !options.magic_learn),
         "Explicit Magic parameters conflict with local planner or preference learning");
     if let Some(url) = &options.magic_llm { crate::models::validate_loopback_llm_url(url)?; }
@@ -201,6 +223,7 @@ pub fn analyze(source: &MagicSource, options: &MagicOptions, output: &Path) -> R
         domain: src.domain, transfer: src.transfer, assumption: src.assumption,
         subject: Some(subject), catalog_online: options.catalog_online,
         proposal, planner_warning, magic_learn: options.magic_learn, preference_prior, preference_variant,
+        starless: options.starless, star_blend: options.star_blend,
         analysis, previews: Vec::new(), artifacts: Vec::new(),
     };
     if session.session_path.exists() {
@@ -212,6 +235,8 @@ pub fn analyze(source: &MagicSource, options: &MagicOptions, output: &Path) -> R
         if previous.catalog_online == session.catalog_online
             && previous.magic_learn == session.magic_learn && previous.preference_prior == session.preference_prior
             && previous.preference_variant == session.preference_variant
+            && previous.starless == session.starless
+            && previous.star_blend == session.star_blend
             && previous.proposal == session.proposal
             && previous.previews.iter().all(|p| p.decision.search.as_ref().is_some_and(|s| s.version == optimize::SEARCH_VERSION))
             && serde_json::to_value(&previous.subject)? == serde_json::to_value(&session.subject)? {
@@ -250,9 +275,23 @@ fn save_masks(dir: &Path, analysis: &mut analysis::ImageAnalysis, masks: &analys
     analysis.masks.version = 1;
     Ok(())
 }
-fn candidate(session: &MagicSession, src: &source::PreviewSource, variant: MagicVariant, strength: f32) -> Result<(crate::config::LinearImage, MagicDecision)> {
+fn candidate(
+    session: &MagicSession,
+    src: &source::PreviewSource,
+    variant: MagicVariant,
+    strength: f32,
+    precomputed_sep: Option<&crate::stars::StarSeparation>,
+) -> Result<(crate::config::LinearImage, MagicDecision)> {
     sane_strength(strength)?;
-    let (analysis, masks) = analysis::analyze_image(&src.baseline, src.domain);
+    let star_blend_opt = effective_star_blend(session.starless, session.star_blend)?;
+    let owned_sep = if strength > 0.0 && star_blend_opt.is_some() && precomputed_sep.is_none() {
+        Some(crate::stars::separate_stars(&src.baseline, crate::config::AcceleratorMode::Auto)?)
+    } else {
+        None
+    };
+    let separated = precomputed_sep.or(owned_sep.as_ref());
+    let working_base = separated.map_or(&src.baseline, |sep| &sep.starless);
+    let (analysis, masks) = analysis::analyze_image(working_base, src.domain);
     let q = analysis.signal_snr.map(|s| ((s - 3.0) / 5.0).clamp(0.0, 1.0).sqrt() * analysis.measurement_confidence).unwrap_or(0.0);
     let strength_curve = strength * (1.4 - 0.4 * strength);
     let factor = (variant.multiplier() * strength_curve * q).clamp(0.0, 1.0);
@@ -269,22 +308,22 @@ fn candidate(session: &MagicSession, src: &source::PreviewSource, variant: Magic
         nominal.color *= scales.color;
     }
     let prior = (session.preference_variant == Some(variant)).then_some(session.preference_prior).flatten();
-    let key = format!("{}:{}:{}:{}:{:?}:{:?}", session.source_digest, recipe.id, recipe.version,
-        optimize::SEARCH_VERSION, session.crop, nominal);
-    let result = optimize::search(&src.baseline, &analysis, &masks, nominal, prior, &key);
+    let key = format!("{}:{}:{}:{}:{:?}:{:?}:{:?}", session.source_digest, recipe.id, recipe.version,
+        optimize::SEARCH_VERSION, session.crop, nominal, star_blend_opt);
+    let result = optimize::search(working_base, &analysis, &masks, nominal, prior, &key);
     let optimized = result.report.winner_parameters;
     let mut optimized_image = Some(result.image);
     let search = result.report;
     let mut attempts = Vec::new();
-    let mut selected = src.baseline.clone();
+    let mut selected = working_base.clone();
     let mut actual = operators::OperatorParams::default();
     for backoff in [1.0, 0.5, 0.25, 0.0] {
         let params = operators::OperatorParams { tone: optimized.tone * backoff, detail: optimized.detail * backoff,
             sharpen: optimized.sharpen * backoff, color: optimized.color * backoff };
         let image = if backoff == 1.0 { optimized_image.take().context("Optimized image already used")? }
-            else if backoff == 0.0 { src.baseline.clone() }
-            else { operators::apply_candidate(&src.baseline, &analysis, &masks, &params) };
-        let quality = validate::validate_candidate(&src.baseline, &image, &analysis, &masks);
+            else if backoff == 0.0 { working_base.clone() }
+            else { operators::apply_candidate(working_base, &analysis, &masks, &params) };
+        let quality = validate::validate_candidate(working_base, &image, &analysis, &masks);
         let passed = quality.passed;
         attempts.push(MagicAttempt { backoff, quality });
         if passed {
@@ -293,15 +332,25 @@ fn candidate(session: &MagicSession, src: &source::PreviewSource, variant: Magic
             break;
         }
     }
+    if let (Some(sep), Some(blend)) = (separated, star_blend_opt) {
+        if blend > 0.0 {
+            crate::stars::screen_blend_stars(&mut selected, &sep.stars, blend);
+        }
+    }
+    let star_suffix = match star_blend_opt {
+        Some(b) if strength > 0.0 && b <= 0.0 => " [starless nebula]".to_string(),
+        Some(b) if strength > 0.0 => format!(" [star-separated, {:.0}% stars]", b * 100.0),
+        _ => String::new(),
+    };
     let explanation = if strength == 0.0 {
         format!("Recipe {}: unmodified common baseline (strength 0.00)", recipe.id)
     } else if q == 0.0 {
-        "Missing reliable significant-structure SNR; unchanged safe baseline".into()
+        format!("Missing reliable significant-structure SNR; unchanged safe baseline{star_suffix}")
     } else if actual == operators::OperatorParams::default() {
-        format!("Recipe {}: no safely measurable gain; unchanged baseline", recipe.id)
+        format!("Recipe {}: no safely measurable gain; unchanged baseline{star_suffix}", recipe.id)
     } else {
         format!(
-            "Recipe {} ({}, {:.0}% scale): applied tone {:+.1}%, detail {:+.1}%, sharpen {:+.1}%, color {:+.1}% (SNR {:.2}, confidence {:.0}%, {} trials, sharpening {})",
+            "Recipe {} ({}, {:.0}% scale): applied tone {:+.1}%, detail {:+.1}%, sharpen {:+.1}%, color {:+.1}% (SNR {:.2}, confidence {:.0}%, {} trials, sharpening {}){star_suffix}",
             recipe.id,
             variant.as_str(),
             variant.multiplier() * strength * 100.0,
@@ -344,6 +393,12 @@ fn id(session: &MagicSession, variant: MagicVariant, strength: f32) -> String {
         digest.update(subject.class.as_str().as_bytes());
         if let Some(selected) = &subject.selected { digest.update(selected.as_bytes()); }
     }
+    if strength > 0.0 {
+        if let Ok(Some(blend)) = effective_star_blend(session.starless, session.star_blend) {
+            digest.update(b"starless-blend:");
+            digest.update(blend.to_le_bytes());
+        }
+    }
     format!("magic-{}-{}", variant.as_str(), &format!("{:x}", digest.finalize())[..12])
 }
 fn relative(session: &MagicSession, path: &Path) -> Result<String> {
@@ -354,9 +409,15 @@ pub fn preview(session: &mut MagicSession, strength: f32) -> Result<Vec<MagicCan
     sane_strength(strength)?;
     let src = loaded(session)?;
     let dir = session.session_path.parent().context("Session has no parent")?;
+    let star_blend_opt = effective_star_blend(session.starless, session.star_blend)?;
+    let shared_sep = if strength > 0.0 && star_blend_opt.is_some() {
+        Some(crate::stars::separate_stars(&src.baseline, crate::config::AcceleratorMode::Auto)?)
+    } else {
+        None
+    };
     let mut results = Vec::new();
     for variant in [MagicVariant::Natural, MagicVariant::Enhanced, MagicVariant::Dramatic] {
-        let (image, decision) = candidate(session, &src, variant, strength)?;
+        let (image, decision) = candidate(session, &src, variant, strength, shared_sep.as_ref())?;
         let name = id(session, variant, strength);
         let png = dir.join(format!("{name}-preview.png"));
         let preview_tiff = dir.join(format!("{name}-preview.tiff"));
@@ -421,6 +482,49 @@ fn render_native(
             baseline.write_tile(x, y, &tile)?;
         }
     }
+    let star_blend_opt = effective_star_blend(session.starless, session.star_blend)?;
+    let mut stars_scratch = if let Some(blend) = star_blend_opt {
+        let mut sl_scratch = source::BaselineScratch::create(dir, width, height)?;
+        let mut st_scratch = (blend > 0.0)
+            .then(|| source::BaselineScratch::create(dir, width, height))
+            .transpose()?;
+        for y in (0..height).step_by(512) {
+            for x in (0..width).step_by(512) {
+                let w = (width - x).min(512);
+                let h = (height - y).min(512);
+                let halo = 32usize;
+                let left = x.saturating_sub(halo);
+                let top = y.saturating_sub(halo);
+                let right = (x + w + halo).min(width);
+                let bottom = (y + h + halo).min(height);
+                let raw_tile = baseline.read_tile(left, top, right - left, bottom - top)?;
+                let sep = crate::stars::separate_stars(&raw_tile, crate::config::AcceleratorMode::Auto)?;
+                let extract_center = |src_img: &crate::config::LinearImage| {
+                    let mut center = crate::config::LinearImage::new(w, h, 3);
+                    let src_n = src_img.pixel_count();
+                    let dst_n = center.pixel_count();
+                    for row in 0..h {
+                        let start = (row + y - top) * src_img.width + x - left;
+                        let dst = row * w;
+                        center.mask[dst..dst + w].copy_from_slice(&src_img.mask[start..start + w]);
+                        for c in 0..3 {
+                            center.data[c * dst_n + dst..c * dst_n + dst + w]
+                                .copy_from_slice(&src_img.data[c * src_n + start..c * src_n + start + w]);
+                        }
+                    }
+                    center
+                };
+                sl_scratch.write_tile(x, y, &extract_center(&sep.starless))?;
+                if let Some(st) = &mut st_scratch {
+                    st.write_tile(x, y, &extract_center(&sep.stars))?;
+                }
+            }
+        }
+        baseline = sl_scratch;
+        st_scratch
+    } else {
+        None
+    };
     let mut selected = None;
     let mut attempts = Vec::new();
     for backoff in [1.0, 0.5, 0.25, 0.0] {
@@ -469,6 +573,12 @@ fn render_native(
                             .copy_from_slice(&candidate.data[c * src_n + start..c * src_n + start + w]);
                     }
                 }
+                if let (Some(st), Some(blend)) = (&mut stars_scratch, star_blend_opt) {
+                    if blend > 0.0 {
+                        let st_center = st.read_tile(x, y, w, h)?;
+                        crate::stars::screen_blend_stars(&mut center, &st_center, blend);
+                    }
+                }
                 output.write_tile(x, y, &center)?;
             }
             if rejected.is_some() { break; }
@@ -495,14 +605,14 @@ fn render_native(
 pub fn render(session: &mut MagicSession, variant: MagicVariant, strength: f32) -> Result<VariantArtifact> {
     sane_strength(strength)?;
     let mut src = loaded(session)?;
-    let (_, mut decision) = candidate(session, &src, variant, strength)?;
+    let (_, mut decision) = candidate(session, &src, variant, strength, None)?;
     let dir = session.session_path.parent().context("Session has no parent")?;
     let name = id(session, variant, strength);
     let tiff = dir.join(format!("{name}.tiff"));
     let png = dir.join(format!("{name}.png"));
     if session.dimensions[0].checked_mul(session.dimensions[1]).context("Native dimensions overflow")? <= 2_000_000 {
         src.baseline = source::load(&session.source, session.crop.is_some())?.baseline;
-        let (image, full_decision) = candidate(session, &src, variant, strength)?;
+        let (image, full_decision) = candidate(session, &src, variant, strength, None)?;
         decision = full_decision;
         write_variant_images(&image, &tiff, &png)?;
     } else {
@@ -510,9 +620,14 @@ pub fn render(session: &mut MagicSession, variant: MagicVariant, strength: f32) 
     }
     let decision_file = dir.join(format!("{name}-decision.json"));
     crate::atomic_write_file(&decision_file, &serde_json::to_vec_pretty(&decision)?)?;
+    let star_title_suffix = match effective_star_blend(session.starless, session.star_blend)? {
+        Some(b) if b <= 0.0 => " (Starless)".to_string(),
+        Some(b) => format!(" ({:.0}% Stars)", b * 100.0),
+        None => String::new(),
+    };
     let artifact = VariantArtifact {
-        id: name.clone(), title: format!("Magic {}", variant.as_str()), palette: session.palette.clone(),
-        description: decision.explanation.clone(), artistic_interpretation: session.palette != "natural" && session.palette != "source-rgb", ai_enhanced: false,
+        id: name.clone(), title: format!("Magic {}{}", variant.as_str(), star_title_suffix), palette: session.palette.clone(),
+        description: decision.explanation.clone(), artistic_interpretation: session.palette != "natural" && session.palette != "source-rgb" || star_title_suffix != "", ai_enhanced: false,
         tiff_path: relative(session, &tiff)?, png_path: relative(session, &png)?, channels_used: session.channels_used.clone(),
         provenance: format!("Magic algorithm 1, source SHA-256 {}; RGB16 linear-light TIFF, sRGB PNG", session.source_digest),
         restore_info: None, finish: None, crop: session.crop,

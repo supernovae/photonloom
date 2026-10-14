@@ -79,6 +79,7 @@ fn public_session(session: &MagicSession) -> serde_json::Value {
         "subject": session.subject, "catalog_online": session.catalog_online,
         "proposal": session.proposal, "planner_warning": session.planner_warning,
         "magic_learn": session.magic_learn, "preference_prior": session.preference_prior,
+        "starless": session.starless, "star_blend": session.star_blend,
         "analysis": session.analysis, "previews": session.previews, "artifacts": session.artifacts,
     })
 }
@@ -979,7 +980,12 @@ fn gallery_selection(root: &Path, target_id: Option<&str>, palette: Option<&str>
     }.ok_or_else(|| magic_error("Unknown target ID"))?;
     let requested = palette.filter(|p| !p.is_empty()).unwrap_or(&target.primary_variant);
     let palette = target.variants.iter()
-        .find(|v| (v.id == requested || v.palette == requested) && v.magic.is_none() && v.restore_info.is_none())
+        .find(|v| {
+            (v.id == requested || v.palette == requested)
+                && v.magic.is_none()
+                && v.restore_info.is_none()
+                && v.finish.is_none_or(|f| f.star_mode == crate::finish_style::StarMode::Standard)
+        })
         .map(|v| v.palette.clone())
         .ok_or_else(|| magic_error("Palette unavailable from original science channels"))?;
     Ok((target.target_id.clone(), palette))

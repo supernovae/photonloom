@@ -110,6 +110,10 @@
               <input id="run-magic-view" type="checkbox">
               Automatically generate Magic View previews &amp; safe Enhanced output after stacking
             </label>
+            <label class="check-label">
+              <input id="run-starless" type="checkbox">
+              Generate Starless Nebula &amp; Stars-Only variants (GPU-offloaded harmonic star separation)
+            </label>
             <div class="card-actions">
               <button type="submit" id="start-run-btn" class="btn primary full-width">Run Stacking Pipeline</button>
             </div>
@@ -240,6 +244,13 @@
             <input id="magic-strength" type="range" min="0" max="1" step="any" value="0.5">
           </div>
 
+
+          <div class="toolbar-group">
+            <label class="check-label">
+              <input id="magic-starless" type="checkbox">
+              Starless Nebula
+            </label>
+          </div>
           <div class="toolbar-actions">
             <button id="magic-start" class="btn primary" type="button" disabled>Make Magic View</button>
             <button id="magic-refresh" class="btn" type="button" disabled>Update Previews</button>
@@ -368,6 +379,17 @@
                   <label for="finish-local-contrast">Dark-nebula detail <output id="finish-local-contrast-value"></output></label>
                   <input id="finish-local-contrast" type="range" min="0" max="0.3" step="0.01" value="0">
                 </details>
+                <label for="finish-star-mode">Star Layer Mode (GPU-offloaded)</label>
+                <select id="finish-star-mode">
+                  <option value="standard">Standard (Keep Stars)</option>
+                  <option value="starless">Starless (Remove Stars — Nebula Only)</option>
+                  <option value="reduced">Star-Reduced (Screen Re-Blend)</option>
+                  <option value="stars-only">Stars Only (Unscreened Star Layer)</option>
+                </select>
+                <div id="finish-star-blend-wrap" class="control-row hidden">
+                  <label for="finish-star-blend">Star Screen Blend <output id="finish-star-blend-value">0.45</output></label>
+                  <input id="finish-star-blend" type="range" min="0" max="1" step="0.05" value="0.45">
+                </div>
                 <label class="check-label"><input id="trim-edges" type="checkbox" checked> Trim alignment edges</label>
                 <p id="finish-crop-info" class="hint"></p>
                 <button type="button" id="apply-finish-btn" class="btn primary">Apply Finish — No Restacking</button>
@@ -392,7 +414,7 @@
 
               <div class="subpanel">
                 <h3>3. Guided Text Edit</h3>
-                <p class="hint">Grammar: <code>brighter/darker</code>, <code>warmer/cooler</code>, <code>more/less saturation</code>, and palette name.</p>
+                <p class="hint">Grammar: <code>starless/remove stars/reduce stars/stars only</code>, <code>brighter/darker</code>, <code>warmer/cooler</code>, <code>more/less saturation</code>, and palette name.</p>
                 <div class="control-row">
                   <input type="text" id="edit-request-input" placeholder="make the HOO image warmer and brighter">
                   <button type="button" id="apply-edit-btn" class="btn primary">Apply Text Edit</button>

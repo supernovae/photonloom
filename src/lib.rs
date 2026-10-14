@@ -14,6 +14,7 @@ pub mod models;
 pub mod raw;
 pub mod register;
 pub mod scan;
+pub mod stars;
 pub mod web;
 
 use anyhow::{Context, Result, bail};
@@ -166,7 +167,13 @@ pub fn process(input: &Path, output: &Path, options: &ProcessOptions) -> Result<
                         gallery: canon_out.clone(), target_id: target_id.clone(), palette: String::new(),
                     };
                     let result = (|| -> Result<()> {
-                        let mut session = magic::analyze(&source, &magic::MagicOptions { crop: options.trim_edges, ..Default::default() }, &canon_out)?;
+                        let resolved_finish = options.finish.resolve().unwrap_or_else(|_| options.finish.preset.resolved_defaults());
+                        let starless = resolved_finish.star_mode == crate::finish_style::StarMode::Starless;
+                        let star_blend = (resolved_finish.star_mode == crate::finish_style::StarMode::Reduced)
+                            .then_some(resolved_finish.star_blend);
+                        let mut session = magic::analyze(&source, &magic::MagicOptions {
+                            crop: options.trim_edges, starless, star_blend, ..Default::default()
+                        }, &canon_out)?;
                         magic::preview(&mut session, 0.0)?;
                         magic::preview(&mut session, 0.5)?;
                         let artifact = magic::render(&mut session, magic::MagicVariant::Enhanced, 0.5)?;
