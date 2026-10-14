@@ -1,0 +1,14 @@
+OpenNGC position data, derived from https://github.com/mattiaverga/OpenNGC
+Revision: 4e2398a263de663d83f7b86be80c368c34335764
+Source files: database_files/NGC.csv and database_files/addendum.csv
+License: Creative Commons Attribution-ShareAlike 4.0 International (CC BY-SA 4.0)
+https://creativecommons.org/licenses/by-sa/4.0/
+
+Attribution: OpenNGC contributors, led by Mattia Verga. Source positions/types,
+angular dimensions, morphological classifications and names have been transformed
+into a compact coordinate-indexed CSV by data/catalog/generate.py. Regenerate from
+repository root with: python3 data/catalog/generate.py
+
+This catalog data and derivative CSV remain CC BY-SA 4.0, distinct from the MIT
+license covering Photonloom source code. The source project documents its own
+upstream references and acknowledgments at https://github.com/mattiaverga/OpenNGC.

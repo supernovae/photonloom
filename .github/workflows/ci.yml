@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+
+jobs:
+  build-and-verify:
+    name: Build, Test & Run Fixture (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact_name: photonloom-linux-x86_64
+            bin_name: photonloom
+          - os: macos-latest
+            artifact_name: photonloom-macos
+            bin_name: photonloom
+          - os: windows-latest
+            artifact_name: photonloom-windows-x86_64
+            bin_name: photonloom.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux native build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake clang libclang-dev pkg-config zlib1g-dev libcfitsio-dev libraw-dev
+
+      - name: Install macOS build dependencies
+        if: runner.os == 'macOS'
+        run: |
+          brew install cmake pkg-config
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run full test suite
+        run: cargo test --all-targets
+
+      - name: Build release binary and fixture generator
+        run: |
+          cargo build --release --bin photonloom
+          cargo build --release --example make_fixture
+
+      - name: Generate synthetic observation fixtures and run binary end-to-end
+        shell: bash
+        run: |
+          FIX_DIR="${RUNNER_TEMP}/photonloom-fixture"
+          cargo run --release --example make_fixture -- "${FIX_DIR}"
+          ./target/release/${{ matrix.bin_name }} run "${FIX_DIR}" --accelerator cpu
+          ./target/release/${{ matrix.bin_name }} run "${FIX_DIR}-rgb" --accelerator cpu
+          ./target/release/${{ matrix.bin_name }} run "${FIX_DIR}-dng" --accelerator cpu
+          ./target/release/${{ matrix.bin_name }} edit "${FIX_DIR}-photonloom" "make the HOO image warmer"
+
+      - name: Stage release binary and runtime dependency notices
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/release/${{ matrix.bin_name }}" dist/
+          cp README.md dist/
+          # Copy any dynamically linked shared libraries produced in target/release/build if present
+          find target/release/build -maxdepth 4 \( -name "*.so*" -o -name "*.dylib" -o -name "*.dll" \) -exec cp -n {} dist/ \; || true
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/
+          if-no-files-found: error

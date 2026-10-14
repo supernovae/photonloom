@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Photonloom — Astrophotography Studio</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="app-header">
+    <div class="header-left">
+      <a href="/gallery" class="brand-link" data-page-link="gallery">
+        <span class="brand-mark" aria-hidden="true">✦</span>
+        <div>
+          <h1>Photonloom</h1>
+          <p class="subtitle">Local Astrophotography Studio</p>
+        </div>
+      </a>
+    </div>
+
+    <nav class="app-nav" aria-label="Main navigation">
+      <a href="/run" id="nav-run" class="nav-link" data-page-link="run">
+        <span class="nav-title">Run &amp; Import</span>
+        <span class="nav-sub">Stack frames or open file</span>
+      </a>
+      <a href="/gallery" id="nav-gallery" class="nav-link" data-page-link="gallery">
+        <span class="nav-title">Gallery</span>
+        <span class="nav-sub">Inspect, histogram &amp; export</span>
+      </a>
+      <a href="/magic" id="nav-magic" class="nav-link" data-page-link="magic">
+        <span class="nav-title">Magic View</span>
+        <span class="nav-sub">Adaptive 3-way finishing</span>
+      </a>
+      <a href="/edit" id="nav-edit" class="nav-link" data-page-link="edit">
+        <span class="nav-title">Edit Studio</span>
+        <span class="nav-sub">Curves, palettes &amp; science</span>
+      </a>
+    </nav>
+
+    <div class="header-right">
+      <div id="magic-target-wrap" class="inline-field hidden">
+        <label for="magic-target">Target</label>
+        <select id="magic-target"></select>
+      </div>
+      <span id="active-source-pill" class="source-pill">No source loaded</span>
+      <span class="security-badge" title="Server binds strictly to 127.0.0.1">Local 127.0.0.1</span>
+    </div>
+  </header>
+
+  <main class="container">
+    <!-- ==================== PAGE 1: RUN & IMPORT (/run) ==================== -->
+    <section id="page-run" class="app-page hidden" aria-labelledby="observe-title">
+      <div class="page-intro">
+        <div>
+          <span class="step-kicker">Source &amp; Pipeline</span>
+          <h2 id="observe-title">Run Stacking Pipeline or Open an Image</h2>
+          <p id="source-summary" class="hint">Process a folder of raw light/calibration frames into a 32-bit FITS gallery, or open a single FITS/TIFF/PNG image directly in Magic View.</p>
+        </div>
+      </div>
+
+      <section id="job-status-panel" class="panel status-panel hidden" aria-live="polite">
+        <div class="status-header">
+          <div>
+            <span class="step-kicker">Active Session Status</span>
+            <h3 id="status-title">Pipeline Run</h3>
+          </div>
+          <div class="inline-actions">
+            <span id="job-badge" class="badge">queued</span>
+            <a href="/gallery" id="status-open-gallery" class="btn primary hidden" data-page-link="gallery">Go to Gallery →</a>
+          </div>
+        </div>
+        <div class="progress-track">
+          <div id="job-progress-bar" class="progress-fill" style="width: 0%"></div>
+        </div>
+        <p id="job-stage-text" class="stage-text">Waiting...</p>
+        <div id="job-error-box" class="error-box hidden"></div>
+        <div id="job-warnings-box" class="warnings-box hidden"></div>
+      </section>
+
+      <div class="run-cards-grid">
+        <div class="panel run-card">
+          <span class="step-kicker">Option A · Full Calibration &amp; Stacking</span>
+          <h3>Stack Raw Observations</h3>
+          <p class="hint">
+            Calibrate, align, and integrate FITS (<code>.fit/.fits/.fts</code>) or camera RAW (<code>.dng/.cr2/.cr3/.nef/.arw/.raf/.rw2</code>) frames from a local server directory.
+          </p>
+          <form id="run-form" class="stack-form">
+            <div class="field-group">
+              <label for="input-path">Input Directory (Server Path) *</label>
+              <input type="text" id="input-path" name="input" placeholder="/path/to/observations" required>
+            </div>
+            <div class="field-group">
+              <label for="output-path">Output Directory (optional)</label>
+              <input type="text" id="output-path" name="output" placeholder="Defaults to sibling <input>-photonloom">
+            </div>
+            <div class="field-group">
+              <label for="initial-palette">Initial Palette</label>
+              <select id="initial-palette" name="palette">
+                <option value="">Automatic from available filters</option>
+                <option value="natural">Natural (RGB)</option>
+                <option value="hoo">HOO</option>
+                <option value="sho">SHO</option>
+                <option value="osh">OSH</option>
+                <option value="hubble">Hubble (Tuned SHO)</option>
+                <option value="jwst-inspired">JWST-Inspired</option>
+                <option value="hubble-inspired">Hubble-Inspired</option>
+              </select>
+            </div>
+            <label class="check-label">
+              <input id="run-magic-view" type="checkbox">
+              Automatically generate Magic View previews &amp; safe Enhanced output after stacking
+            </label>
+            <div class="card-actions">
+              <button type="submit" id="start-run-btn" class="btn primary full-width">Run Stacking Pipeline</button>
+            </div>
+            <p class="small-hint">CLI equivalent: <code>photonloom run /path/to/observations --accelerator auto</code></p>
+          </form>
+        </div>
+
+        <div class="panel run-card">
+          <span class="step-kicker">Option B · Single File Finishing</span>
+          <h3>Open Standalone Image in Magic View</h3>
+          <p class="hint">
+            Inspect and finish an already-stacked FITS, 16-bit/8-bit TIFF, or PNG directly in Magic View without creating a synthetic gallery target.
+          </p>
+          <form id="file-form" class="stack-form">
+            <div class="field-group">
+              <label for="file-path">Standalone Image Path *</label>
+              <input id="file-path" type="text" placeholder="/path/to/image.fits">
+            </div>
+            <div class="field-group">
+              <label for="file-output">Magic Output Directory *</label>
+              <input id="file-output" type="text" placeholder="/path/to/magic-output">
+            </div>
+            <div class="two-col">
+              <div class="field-group">
+                <label for="file-domain">Input Domain</label>
+                <select id="file-domain">
+                  <option value="auto">Auto-detect</option>
+                  <option value="linear">Linear</option>
+                  <option value="display">Already stretched</option>
+                </select>
+              </div>
+              <div class="field-group">
+                <label for="file-transfer">Color Transfer</label>
+                <select id="file-transfer">
+                  <option value="auto">Auto-detect</option>
+                  <option value="linear">Linear</option>
+                  <option value="srgb">sRGB</option>
+                </select>
+              </div>
+            </div>
+            <p class="small-hint">Untagged external TIFF defaults to sRGB unless it matches a validated Photonloom gallery TIFF.</p>
+            <div class="card-actions">
+              <button class="btn primary full-width" type="submit">Open in Magic View →</button>
+            </div>
+          </form>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================== PAGE 2: GALLERY (/gallery) ==================== -->
+    <section id="page-gallery" class="app-page hidden" aria-labelledby="active-target-title">
+      <div id="gallery-empty-state" class="panel empty-stage hidden">
+        <h3>No Gallery Loaded Yet</h3>
+        <p class="hint">Start a stacking run on the Run page to inspect calibrated variants, histograms, and science files.</p>
+        <a href="/run" class="btn primary" data-page-link="run">Go to Run &amp; Import →</a>
+      </div>
+
+      <div id="gallery-workspace" class="hidden">
+        <div class="workspace-grid">
+          <div class="panel preview-panel">
+            <div class="preview-header">
+              <div>
+                <span class="step-kicker">Target Gallery Viewer</span>
+                <h2 id="active-target-title">Target Gallery</h2>
+                <p id="active-variant-subtitle" class="muted"></p>
+                <p id="target-story" class="hint hidden"></p>
+              </div>
+              <div id="active-badges" class="badges"></div>
+            </div>
+
+            <div class="main-viewer">
+              <img id="main-preview-img" src="" alt="Selected gallery variant preview">
+            </div>
+
+            <div class="preview-footer">
+              <div class="preview-meta">
+                <p id="active-variant-desc"></p>
+                <p id="active-variant-prov" class="prov-line"></p>
+                <div class="download-bar">
+                  <a id="download-tiff-btn" class="btn primary" href="#" download>Download 16-bit TIFF</a>
+                  <a id="download-png-btn" class="btn" href="#" download>Download sRGB PNG</a>
+                  <a href="/magic" id="open-magic-from-gallery" class="btn accent-outline" data-page-link="magic">Open in Magic View →</a>
+                  <a href="/edit" class="btn" data-page-link="edit">Manual Edit Studio →</a>
+                </div>
+              </div>
+              <div class="histogram-panel">
+                <canvas id="display-histogram" width="512" height="168" aria-label="RGB display-preview histogram"></canvas>
+                <p id="histogram-caption" class="hint">Display histogram loads with the preview.</p>
+              </div>
+            </div>
+          </div>
+
+          <aside class="panel variants-sidebar">
+            <div class="sidebar-header">
+              <div>
+                <span class="step-kicker">Rendered Outputs</span>
+                <h3>Available Variants</h3>
+              </div>
+              <span id="variant-count-badge" class="badge">0</span>
+            </div>
+            <p class="hint">Select any palette, manual finish, or rendered Magic variant to inspect it.</p>
+            <div id="variant-cards-grid" class="cards-grid"></div>
+          </aside>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================== PAGE 3: MAGIC VIEW (/magic) ==================== -->
+    <section id="page-magic" class="app-page magic-panel hidden" aria-labelledby="magic-title">
+      <div class="panel">
+        <div class="magic-header">
+          <div>
+            <span class="step-kicker">Adaptive Measured Finishing</span>
+            <h2 id="magic-title">Magic View</h2>
+            <p class="hint">Measures sky noise, PSF stars, multiscale structure, and color from the original source to propose three independent, safety-gated interpretations.</p>
+          </div>
+          <span id="magic-status" class="status-pill" role="status" aria-live="polite">Ready</span>
+        </div>
+
+        <div class="magic-toolbar">
+          <div class="toolbar-group">
+            <span class="field-label">Source Palette</span>
+            <div id="magic-palettes" class="palette-tabs" role="group" aria-label="Available palettes"></div>
+          </div>
+
+          <div class="toolbar-group strength-group">
+            <label for="magic-strength">Strength <output id="magic-strength-value">0.50</output></label>
+            <input id="magic-strength" type="range" min="0" max="1" step="any" value="0.5">
+          </div>
+
+          <div class="toolbar-actions">
+            <button id="magic-start" class="btn primary" type="button" disabled>Make Magic View</button>
+            <button id="magic-refresh" class="btn" type="button" disabled>Update Previews</button>
+          </div>
+        </div>
+
+        <div id="magic-feedback" class="feedback-banner hidden" role="status" aria-live="polite"></div>
+
+        <div id="magic-empty-state" class="empty-stage">
+          <h3>Ready to Generate Magic Previews</h3>
+          <p class="hint">Choose a source palette above and click <strong>Make Magic View</strong> to compare Natural, Enhanced, and Dramatic interpretations.</p>
+        </div>
+
+        <div id="magic-cards" class="magic-cards"></div>
+
+        <div id="magic-comparison" class="compare-section hidden">
+          <div class="compare-layout">
+            <div class="compare-stage">
+              <div class="compare-stage-bar">
+                <h3>Before / After — Same Source Crop</h3>
+                <span class="compare-legend">Left: Unmodified Baseline · Right: Selected Magic Preview</span>
+              </div>
+              <div class="compare-view">
+                <img id="magic-before" alt="Unmodified common baseline">
+                <img id="magic-after" alt="Selected Magic preview">
+                <input id="magic-split" type="range" min="0" max="100" value="50" aria-label="Before and after split">
+              </div>
+            </div>
+
+            <aside class="compare-inspector">
+              <span class="step-kicker">Selected Interpretation</span>
+              <h3 id="magic-selected-heading">Enhanced</h3>
+              <p id="magic-explanation" class="explanation-box"></p>
+              <div class="render-box">
+                <button id="magic-render" class="btn primary full-width" type="button">Render Selected Variant at Full Resolution</button>
+                <p class="hint small-hint">Full-resolution rendering validates every tile against noise, star bloat, clipping, and seam safety gates.</p>
+                <div id="magic-downloads" class="download-bar hidden">
+                  <a id="magic-tiff" class="btn primary" download>Download RGB16 TIFF</a>
+                  <a id="magic-png" class="btn" download>Download sRGB PNG</a>
+                </div>
+              </div>
+            </aside>
+          </div>
+        </div>
+      </div>
+
+      <details id="advanced-tools" class="advanced-tools">
+        <summary>Advanced — Catalog, Local Planner, Preferences, Debug Masks &amp; Replay JSON</summary>
+        <div class="diagnostics-grid">
+          <div class="panel">
+            <span class="step-kicker">Opt-In Privacy &amp; Assistance</span>
+            <h3>Catalog, Local Planner &amp; Preferences</h3>
+            <div class="control-row">
+              <label class="check-label">
+                <input id="magic-catalog-online" type="checkbox">
+                Query SIMBAD online with validated WCS coordinates (5s limit; offline OpenNGC by default)
+              </label>
+              <div class="field-group">
+                <label for="magic-llm-url">Optional local planner (loopback llama-server URL)</label>
+                <input id="magic-llm-url" type="url" placeholder="http://127.0.0.1:8080" autocomplete="off">
+              </div>
+              <label class="check-label">
+                <input id="magic-learn" type="checkbox">
+                Remember only my explicitly rendered class, recipe, variant &amp; strength locally
+              </label>
+              <div class="inline-actions">
+                <button id="magic-reset-preferences" type="button" class="btn">Reset Local Preferences</button>
+                <span id="magic-preference-history" class="hint no-margin">Preference history disabled.</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="preview-header">
+              <div>
+                <span class="step-kicker">Reproducibility</span>
+                <h3>Debug Masks &amp; CLI Replay JSON</h3>
+              </div>
+              <button id="magic-export-parameters" type="button" class="btn" disabled>Export Selected Parameters JSON</button>
+            </div>
+            <div id="magic-masks" class="download-bar"></div>
+            <label class="field-label">CLI Replay Parameters (<code>--magic-parameters</code>)</label>
+            <pre id="magic-parameter-preview" class="magic-report">Select a Magic preview to inspect its replayable JSON proposal.</pre>
+          </div>
+
+          <div class="panel full-span">
+            <span class="step-kicker">Measured Diagnostics</span>
+            <h3>Session Analysis &amp; Safety Gate Report</h3>
+            <pre id="magic-report" class="magic-report">Run Magic View to see measured analysis and decisions.</pre>
+          </div>
+        </div>
+      </details>
+    </section>
+
+    <!-- ==================== PAGE 4: EDIT STUDIO (/edit) ==================== -->
+    <section id="page-edit" class="app-page hidden" aria-labelledby="studio-title">
+      <div id="edit-empty-state" class="panel empty-stage hidden">
+        <h3>Manual Studio Requires a Loaded Gallery</h3>
+        <p class="hint">Manual curve finishing and linear channel mixing operate on calibrated 32-bit FITS integrations from a gallery run.</p>
+        <a href="/run" class="btn primary" data-page-link="run">Go to Run &amp; Import →</a>
+      </div>
+
+      <div id="edit-workspace" class="workspace-grid">
+        <div class="panel">
+          <span class="step-kicker">Non-Destructive Manual Finishing</span>
+          <h2 id="studio-title">Edit Studio &amp; Science Channels</h2>
+          <p class="hint">Rerender directly from stored 32-bit linear FITS integrations without repeating calibration or stacking. Linear science FITS stay untouched.</p>
+          <div id="control-feedback" class="feedback-msg" role="status" aria-live="polite"></div>
+
+          <div class="manual-columns">
+            <div class="subpanel">
+              <h3>1. Display Finish &amp; Curves</h3>
+              <div class="control-row">
+                <label for="finish-preset">Finish Recipe</label>
+                <select id="finish-preset"><option value="balanced">Balanced</option></select>
+                <details class="finish-advanced" open>
+                  <summary>Parametric curve &amp; color adjustments</summary>
+                  <label for="finish-exposure">Brightness (stops) <output id="finish-exposure-value"></output></label>
+                  <input id="finish-exposure" type="range" min="-4" max="4" step="0.05" value="0">
+                  <label for="finish-contrast">Contrast curve <output id="finish-contrast-value"></output></label>
+                  <input id="finish-contrast" type="range" min="0.5" max="1.8" step="0.01" value="1">
+                  <label for="finish-saturation">Saturation <output id="finish-saturation-value"></output></label>
+                  <input id="finish-saturation" type="range" min="0" max="1.8" step="0.01" value="1">
+                  <label for="finish-gamma">Midtone gamma <output id="finish-gamma-value"></output></label>
+                  <input id="finish-gamma" type="range" min="0.5" max="2" step="0.01" value="1">
+                  <label for="finish-local-contrast">Dark-nebula detail <output id="finish-local-contrast-value"></output></label>
+                  <input id="finish-local-contrast" type="range" min="0" max="0.3" step="0.01" value="0">
+                </details>
+                <label class="check-label"><input id="trim-edges" type="checkbox" checked> Trim alignment edges</label>
+                <p id="finish-crop-info" class="hint"></p>
+                <button type="button" id="apply-finish-btn" class="btn primary">Apply Finish — No Restacking</button>
+              </div>
+            </div>
+
+            <div class="manual-stack">
+              <div class="subpanel">
+                <h3>2. Preset &amp; Custom Channel Mix</h3>
+                <div class="control-row">
+                  <label for="rerender-palette">Preset Palette</label>
+                  <select id="rerender-palette"></select>
+                  <button type="button" id="apply-preset-btn" class="btn">Select / Rerender Preset</button>
+                </div>
+                <hr class="sep">
+                <div class="control-row">
+                  <label for="custom-mix-input">Custom Linear Mix (R,G,B)</label>
+                  <input type="text" id="custom-mix-input" placeholder="Ha:1,Ha:0.7+OIII:0.3,OIII:1">
+                  <button type="button" id="apply-mix-btn" class="btn">Rerender Custom Mix</button>
+                </div>
+              </div>
+
+              <div class="subpanel">
+                <h3>3. Guided Text Edit</h3>
+                <p class="hint">Grammar: <code>brighter/darker</code>, <code>warmer/cooler</code>, <code>more/less saturation</code>, and palette name.</p>
+                <div class="control-row">
+                  <input type="text" id="edit-request-input" placeholder="make the HOO image warmer and brighter">
+                  <button type="button" id="apply-edit-btn" class="btn primary">Apply Text Edit</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <aside class="manual-sidebar">
+          <div class="panel manual-preview-card">
+            <span class="step-kicker">Active Reference Preview</span>
+            <h3 id="manual-current-title">Active Variant</h3>
+            <div class="mini-viewer">
+              <img id="manual-preview-img" src="" alt="Current variant reference">
+            </div>
+            <div class="download-bar">
+              <a href="/gallery" class="btn full-width" data-page-link="gallery">Inspect Full Size in Gallery →</a>
+            </div>
+          </div>
+
+          <div class="panel">
+            <span class="step-kicker">Calibrated Integrations</span>
+            <h3>Linear Science FITS &amp; Provenance</h3>
+            <p class="hint">Download untouched 32-bit floating-point master integrations per filter.</p>
+            <ul id="science-fits-list" class="science-list"></ul>
+            <div id="omitted-palettes-box" class="omitted-list"></div>
+          </div>
+        </aside>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/histogram.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

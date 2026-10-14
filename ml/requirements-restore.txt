@@ -1,0 +1,7 @@
+# Optional local neural restoration dependencies for `photonloom run --restore`
+# Install into your Python environment or virtualenv:
+#   pip install -r ml/requirements-restore.txt
+torch>=2.4.0,<2.8.0
+numpy>=1.26.0,<3.0.0
+Pillow>=10.3.0,<12.0.0
+tifffile>=2024.5.10
