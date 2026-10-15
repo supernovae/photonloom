@@ -1,6 +1,6 @@
 [package]
 name = "photonloom"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Cross-platform astrophotography calibration, registration, integration, and gallery engine"
 license = "MIT"
@@ -12,7 +12,7 @@ bytemuck = { version = "1.21", features = ["derive"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 csv = "1.3"
 directories = "6.0"
-fitsio = { version = "0.21", features = ["fitsio-src"] }
+fitsio = { version = "0.21", features = ["fitsio-src", "src-cmake"] }
 fitsio-sys = "0.5"
 image = { version = "0.25", default-features = false, features = ["png", "tiff"] }
 libloading = "0.8"

@@ -547,7 +547,7 @@ impl BaselineScratch {
         file.as_file().set_len(u64::try_from(len)?)?;
         // set_len can reserve only sparse metadata on Unix. Reserve actual
         // blocks so an insufficient filesystem fails before any tile work.
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         {
             use std::os::fd::AsRawFd;
             unsafe extern "C" {

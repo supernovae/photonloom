@@ -3,8 +3,13 @@ name: CI
 on:
   push:
     branches: ["main", "master"]
+    tags: ["v*"]
   pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -19,12 +24,15 @@ jobs:
         include:
           - os: ubuntu-latest
             artifact_name: photonloom-linux-x86_64
+            archive_ext: tar.gz
             bin_name: photonloom
           - os: macos-latest
-            artifact_name: photonloom-macos
+            artifact_name: photonloom-macos-arm64
+            archive_ext: tar.gz
             bin_name: photonloom
           - os: windows-latest
             artifact_name: photonloom-windows-x86_64
+            archive_ext: zip
             bin_name: photonloom.exe
     runs-on: ${{ matrix.os }}
     steps:
@@ -42,6 +50,21 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           brew install cmake pkg-config
+          echo "MACOSX_DEPLOYMENT_TARGET=11.0" >> "$GITHUB_ENV"
+
+      - name: Configure Windows MinGW GNU toolchain and CMake
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          echo "C:\mingw64\bin" >> "$GITHUB_PATH"
+          export PATH="/c/mingw64/bin:$PATH"
+          if ! command -v ninja >/dev/null 2>&1; then
+            choco install ninja -y
+          fi
+          echo "CC=gcc" >> "$GITHUB_ENV"
+          echo "CXX=g++" >> "$GITHUB_ENV"
+          echo "CMAKE_GENERATOR=Ninja" >> "$GITHUB_ENV"
+          rustup set default-host x86_64-pc-windows-gnu
 
       - name: Install Rust stable toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -67,15 +90,137 @@ jobs:
       - name: Stage release binary and runtime dependency notices
         shell: bash
         run: |
-          mkdir -p dist
+          mkdir -p dist archive
           cp "target/release/${{ matrix.bin_name }}" dist/
           cp README.md dist/
+          cp data/catalog/LICENSE.OpenNGC.txt dist/
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            ldd "target/release/${{ matrix.bin_name }}" \
+              | awk 'tolower($3) ~ /mingw/ {print $3}' \
+              | xargs -r -I{} cp -n "{}" dist/ || true
+          fi
           # Copy any dynamically linked shared libraries produced in target/release/build if present
           find target/release/build -maxdepth 4 \( -name "*.so*" -o -name "*.dylib" -o -name "*.dll" \) -exec cp -n {} dist/ \; || true
+          if [ "${{ matrix.archive_ext }}" = "zip" ]; then
+            (cd dist && 7z a -tzip "../archive/${{ matrix.artifact_name }}.zip" *)
+          else
+            tar -C dist -czf "archive/${{ matrix.artifact_name }}.tar.gz" .
+          fi
 
-      - name: Upload release artifact
+      - name: Upload release binary directory artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
           path: dist/
           if-no-files-found: error
+
+      - name: Upload release archive artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: archive-${{ matrix.artifact_name }}
+          path: archive/
+          if-no-files-found: error
+
+  docker:
+    name: Build, Verify & Publish Container (GHCR)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=raw,value=0.1.1
+            type=raw,value=v0.1.1
+            type=raw,value=0.11
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=ref,event=tag
+            type=sha
+
+      - name: Build container image locally for verification
+        run: docker build -t photonloom:ci .
+
+      - name: Verify container image end-to-end
+        run: |
+          docker run --rm photonloom:ci --help
+          OUT_DIR="${RUNNER_TEMP}/container-magic"
+          mkdir -p "${OUT_DIR}"
+          chmod 0777 "${OUT_DIR}"
+          docker run --rm \
+            -v "${GITHUB_WORKSPACE}/docs/assets:/input:ro" \
+            -v "${OUT_DIR}:/results:rw" \
+            photonloom:ci magic view /input/example-ctb1-hoo-rgb16.tiff \
+            --output /results/ctb1 \
+            --transfer linear \
+            --variant enhanced --strength 0.5
+          ls -la "${OUT_DIR}/ctb1"
+
+      - name: Tag and push container image to GHCR
+        if: github.event_name != 'pull_request'
+        env:
+          DOCKER_TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          while IFS= read -r tag; do
+            [ -z "$tag" ] && continue
+            echo "Tagging and pushing $tag"
+            docker tag photonloom:ci "$tag"
+            docker push "$tag"
+          done <<< "$DOCKER_TAGS"
+
+  release:
+    name: Publish GitHub Release
+    needs: [build-and-verify, docker]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download release archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: archive-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS.txt
+        working-directory: release-assets
+        run: |
+          sha256sum photonloom-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            release-assets/photonloom-linux-x86_64.tar.gz
+            release-assets/photonloom-macos-arm64.tar.gz
+            release-assets/photonloom-windows-x86_64.zip
+            release-assets/SHA256SUMS.txt
+          body: |
+            ### Container Image (GHCR)
+            ```bash
+            docker pull ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+            docker pull ghcr.io/${{ github.repository }}:latest
+            ```

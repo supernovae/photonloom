@@ -489,7 +489,7 @@ pub fn write_fits_linear(
             .with_context(|| format!("Failed to write FITS pixels to '{}'", dest.display()))?;
     }
 
-    std::fs::File::open(&tmp_fits_path)?
+    std::fs::OpenOptions::new().write(true).open(&tmp_fits_path)?
         .sync_all()
         .with_context(|| {
             format!(

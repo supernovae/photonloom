@@ -269,13 +269,14 @@ Core processing requires **no** Python, PyTorch, or LLM server. Two opt-in local
 Photonloom runs headlessly in Docker and Kubernetes using the same `photonloom` binary without requiring a GPU node:
 
 ```bash
-# Docker build & batch run
-docker build -t photonloom:latest .
+# Run prebuilt container directly from GitHub Container Registry (GHCR)
 docker run --rm \
   -v /path/to/observations:/observations:ro \
   -v /path/to/results:/results:rw \
-  photonloom:latest
+  ghcr.io/supernovae/photonloom:latest
 
+# Or build locally from Dockerfile
+docker build -t photonloom:latest .
 # Kubernetes Job (deploy/photonloom-job.yaml)
 kubectl apply -f deploy/photonloom-job.yaml
 kubectl wait --for=condition=complete --timeout=300s job/photonloom-run

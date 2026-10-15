@@ -15,14 +15,18 @@ WORKDIR /src
 ENV CMAKE_POLICY_VERSION_MINIMUM=3.5
 
 COPY Cargo.toml Cargo.lock* ./
+COPY data ./data
 COPY src ./src
 COPY examples ./examples
 COPY tests ./tests
 COPY ml ./ml
-
 RUN cargo build --release --bin photonloom
 
 FROM debian:bookworm-slim AS runtime
+LABEL org.opencontainers.image.title="Photonloom" \
+      org.opencontainers.image.description="Cross-platform astrophotography calibration, registration, integration, and gallery engine" \
+      org.opencontainers.image.source="https://github.com/supernovae/photonloom" \
+      org.opencontainers.image.licenses="MIT"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
@@ -35,6 +39,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && chown -R photonloom:photonloom /results
 
 COPY --from=builder /src/target/release/photonloom /usr/local/bin/photonloom
+COPY data/catalog/LICENSE.OpenNGC.txt /usr/local/share/photonloom/LICENSE.OpenNGC.txt
 
 USER 10001:10001
 WORKDIR /home/photonloom
