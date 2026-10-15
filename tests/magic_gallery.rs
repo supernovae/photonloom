@@ -30,7 +30,7 @@ fn named_gallery_target_only_uses_real_filters_and_leaves_science_untouched() {
     });
     let manifest = serde_json::json!({
         "version":1,"run_id":"run-test","run_dir":"runs/run-test","canonical_input":"/unused",
-        "canonical_output":root.to_str().unwrap(),"created_at_unix_ms":0,
+        "canonical_output":root.canonicalize().unwrap().to_str().unwrap(),"created_at_unix_ms":0,
         "accelerator_requested":"cpu","accelerator_used":"cpu","targets":[target],
         "warnings":[],"rejected_frames":[]
     });

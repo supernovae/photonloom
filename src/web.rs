@@ -321,7 +321,9 @@ fn load_sample_gallery(gallery_dir: &Path) -> Result<RunJob> {
             manifest_path.display()
         )
     })?;
-    if Path::new(&manifest.canonical_output) != root {
+    if Path::new(&manifest.canonical_output) != root
+        && Path::new(&manifest.canonical_output).canonicalize().ok().as_deref() != Some(root.as_path())
+    {
         bail!(
             "Sample gallery '{}' has manifest output '{}'; serve the completed gallery at its recorded output path",
             root.display(),

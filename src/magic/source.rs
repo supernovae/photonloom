@@ -108,11 +108,17 @@ fn display_raster(path: &Path, transfer: TransferFunction) -> Result<LinearImage
     Ok(out)
 }
 
+fn matches_gallery_root(manifest_canonical_output: &str, canonical_root: &Path) -> bool {
+    let recorded = Path::new(manifest_canonical_output);
+    recorded == canonical_root || recorded.canonicalize().ok().as_deref() == Some(canonical_root)
+}
+
 fn adjacent_gallery_transfer(path: &Path) -> bool {
     let Some(root) = path.parent().and_then(Path::parent).and_then(Path::parent) else { return false };
     let Ok(bytes) = std::fs::read(root.join("manifest.json")) else { return false };
     let Ok(manifest) = serde_json::from_slice::<GalleryManifest>(&bytes) else { return false };
-    if root.canonicalize().ok().as_deref() != Some(Path::new(&manifest.canonical_output)) { return false }
+    let Ok(canon_root) = root.canonicalize() else { return false };
+    if !matches_gallery_root(&manifest.canonical_output, &canon_root) { return false }
     manifest.targets.iter().flat_map(|t| &t.variants).any(|variant| {
         checked_asset(root, &variant.tiff_path).ok().as_deref() == Some(path)
     })
@@ -123,7 +129,7 @@ pub fn load(source: &MagicSource, crop_enabled: bool) -> Result<LoadedSource> {
         MagicSource::Gallery { gallery, target_id, palette } => {
             let root = gallery.canonicalize().with_context(|| format!("Opening gallery {}", gallery.display()))?;
             let manifest: GalleryManifest = serde_json::from_slice(&std::fs::read(root.join("manifest.json"))?)?;
-            ensure!(Path::new(&manifest.canonical_output) == root, "Gallery root disagrees with manifest canonical output");
+            ensure!(matches_gallery_root(&manifest.canonical_output, &root), "Gallery root disagrees with manifest canonical output");
             ensure!(Path::new(target_id).components().count() == 1
                 && target_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
                 && !target_id.is_empty(), "Invalid gallery target ID");
@@ -361,7 +367,7 @@ pub fn load_preview(source: &MagicSource, crop_enabled: bool) -> Result<PreviewS
         MagicSource::Gallery { gallery, target_id, palette } => {
             let root = gallery.canonicalize()?;
             let manifest: GalleryManifest = serde_json::from_slice(&std::fs::read(root.join("manifest.json"))?)?;
-            ensure!(Path::new(&manifest.canonical_output) == root, "Gallery root disagrees with manifest");
+            ensure!(matches_gallery_root(&manifest.canonical_output, &root), "Gallery root disagrees with manifest");
             ensure!(!target_id.is_empty() && target_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'), "Invalid target ID");
             let target = manifest.targets.iter().find(|t| &t.target_id == target_id).context("Unknown target ID")?;
             let pal = if palette.is_empty() {
