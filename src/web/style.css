@@ -421,6 +421,55 @@ select:focus {
   color: #e3b341;
   font-size: 0.85rem;
 }
+.activity-head {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  margin-top: 0.85rem;
+  color: var(--muted);
+  font-size: 0.84rem;
+}
+.activity-head button { margin-left: auto; }
+.activity-console {
+  min-height: 5rem;
+  max-height: 17rem;
+  overflow: auto;
+  margin: 0.5rem 0 0;
+  padding: 0.8rem;
+  background: #080b10;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--fg);
+  font: 0.8rem/1.55 ui-monospace, SFMono-Regular, Consolas, monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.flow-step { margin-top: 0.7rem; }
+.plan-card {
+  background: var(--panel-alt);
+  border: 1px solid var(--border);
+  padding: 0.9rem;
+  border-radius: 6px;
+  font-size: 0.9rem;
+}
+.plan-card p { margin: 0.45rem 0; }
+.plan-target { margin-top: 0.65rem; padding-top: 0.55rem; border-top: 1px solid var(--border); }
+.plan-target div { color: var(--muted); }
+.cli-line { display: flex; justify-content: space-between; gap: 0.6rem; align-items: center; font-size: 0.83rem; }
+.cli-line code { overflow-wrap: anywhere; }
+.recent-runs { display: grid; gap: 0.4rem; }
+.recent-item {
+  text-align: left;
+  color: var(--fg);
+  background: var(--panel-alt);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.65rem;
+  cursor: pointer;
+}
+.recent-item:hover { border-color: var(--accent); }
+#watch-card, #page-run > .panel:last-child { margin-top: 1.1rem; }
+#watch-banner a { color: var(--accent); }
 
 /* Page 2 & 4: Workspace Grids */
 .workspace-grid {

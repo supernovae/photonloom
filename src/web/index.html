@@ -48,6 +48,7 @@
   </header>
 
   <main class="container">
+    <div id="watch-banner" class="feedback-banner hidden" role="status">New integration ready — <a href="/gallery" id="watch-view" data-page-link="gallery">view</a></div>
     <!-- ==================== PAGE 1: RUN & IMPORT (/run) ==================== -->
     <section id="page-run" class="app-page hidden" aria-labelledby="observe-title">
       <div class="page-intro">
@@ -58,6 +59,14 @@
         </div>
       </div>
 
+      <section id="watch-card" class="panel hidden" aria-live="polite">
+        <span class="step-kicker">Automatic folder watch</span>
+        <h3 id="watch-heading">Watching for new frames</h3>
+        <p id="watch-paths"></p>
+        <p id="watch-state"></p>
+        <p id="watch-last"></p>
+        <p id="watch-next"></p>
+      </section>
       <section id="job-status-panel" class="panel status-panel hidden" aria-live="polite">
         <div class="status-header">
           <div>
@@ -72,27 +81,32 @@
         <div class="progress-track">
           <div id="job-progress-bar" class="progress-fill" style="width: 0%"></div>
         </div>
-        <p id="job-stage-text" class="stage-text">Waiting...</p>
+        <p id="job-stage-text" class="stage-text">Preparing the run…</p>
+        <div class="activity-head"><strong>Activity</strong><span id="job-clock">00:00 elapsed</span><button type="button" id="copy-run-log" class="btn">Copy log</button></div>
+        <pre id="run-activity" class="activity-console" aria-live="polite"></pre>
         <div id="job-error-box" class="error-box hidden"></div>
         <div id="job-warnings-box" class="warnings-box hidden"></div>
       </section>
 
       <div class="run-cards-grid">
         <div class="panel run-card">
-          <span class="step-kicker">Option A · Full Calibration &amp; Stacking</span>
-          <h3>Stack Raw Observations</h3>
+          <span class="step-kicker">Guided run · Step 1</span>
+          <h3>Choose observations folder</h3>
           <p class="hint">
             Calibrate, align, and integrate FITS (<code>.fit/.fits/.fts</code>) or camera RAW (<code>.dng/.cr2/.cr3/.nef/.arw/.raf/.rw2</code>) frames from a local server directory.
           </p>
           <form id="run-form" class="stack-form">
             <div class="field-group">
-              <label for="input-path">Input Directory (Server Path) *</label>
+              <label for="input-path">Observations folder (on this computer) *</label>
               <input type="text" id="input-path" name="input" placeholder="/path/to/observations" required>
             </div>
             <div class="field-group">
               <label for="output-path">Output Directory (optional)</label>
               <input type="text" id="output-path" name="output" placeholder="Defaults to sibling <input>-photonloom">
             </div>
+            <button type="button" id="check-folder" class="btn">Check folder</button>
+            <div id="plan-card" class="plan-card hidden" aria-live="polite"></div>
+            <h3 class="flow-step">Step 2 · Choose your options</h3>
             <div class="field-group">
               <label for="initial-palette">Initial Palette</label>
               <select id="initial-palette" name="palette">
@@ -106,18 +120,28 @@
                 <option value="hubble-inspired">Hubble-Inspired</option>
               </select>
             </div>
+            <div class="field-group">
+              <label for="run-accelerator">Accelerator</label>
+              <select id="run-accelerator"><option value="auto">Auto (recommended)</option><option value="gpu">GPU</option><option value="cpu">CPU</option></select>
+            </div>
             <label class="check-label">
-              <input id="run-magic-view" type="checkbox">
-              Automatically generate Magic View previews &amp; safe Enhanced output after stacking
+              <input id="run-magic-view" type="checkbox" checked>
+              Generate Magic View previews and a safe Enhanced output
             </label>
             <label class="check-label">
               <input id="run-starless" type="checkbox">
               Generate Starless Nebula &amp; Stars-Only variants (GPU-offloaded harmonic star separation)
             </label>
+            <details class="finish-advanced"><summary>Advanced</summary>
+              <div class="field-group"><label for="run-mix">Custom mix</label><input id="run-mix" type="text" placeholder="Ha:1,Ha:0.7+OIII:0.3,OIII:1"></div>
+              <label class="check-label"><input id="run-restore" type="checkbox"> Restore detail</label>
+              <label class="check-label"><input id="run-keep-edges" type="checkbox"> Keep edges (disable trimming)</label>
+            </details>
+            <h3 class="flow-step">Step 3 · Run</h3>
             <div class="card-actions">
-              <button type="submit" id="start-run-btn" class="btn primary full-width">Run Stacking Pipeline</button>
+              <button type="submit" id="start-run-btn" class="btn primary full-width" disabled>Check folder to continue</button>
             </div>
-            <p class="small-hint">CLI equivalent: <code>photonloom run /path/to/observations --accelerator auto</code></p>
+            <div class="cli-line"><span>CLI equivalent: <code id="cli-equivalent"></code></span><button type="button" id="copy-cli" class="btn">Copy</button></div>
           </form>
         </div>
 
@@ -133,8 +157,8 @@
               <input id="file-path" type="text" placeholder="/path/to/image.fits">
             </div>
             <div class="field-group">
-              <label for="file-output">Magic Output Directory *</label>
-              <input id="file-output" type="text" placeholder="/path/to/magic-output">
+              <label for="file-output">Magic output directory (optional)</label>
+              <input id="file-output" type="text" placeholder="Defaults to &lt;image&gt;-magic beside the file">
             </div>
             <div class="two-col">
               <div class="field-group">
@@ -161,6 +185,7 @@
           </form>
         </div>
       </div>
+      <section class="panel"><h3>Recent runs</h3><div id="recent-runs" class="recent-runs"></div></section>
     </section>
 
     <!-- ==================== PAGE 2: GALLERY (/gallery) ==================== -->
@@ -258,6 +283,11 @@
         </div>
 
         <div id="magic-feedback" class="feedback-banner hidden" role="status" aria-live="polite"></div>
+        <div id="magic-activity-wrap" class="hidden">
+          <div class="progress-track"><div id="magic-progress-bar" class="progress-fill" style="width:0%"></div></div>
+          <div class="activity-head"><strong>Magic activity</strong><span id="magic-clock">00:00 elapsed</span><button type="button" id="copy-magic-log" class="btn">Copy log</button></div>
+          <pre id="magic-activity" class="activity-console" aria-live="polite"></pre>
+        </div>
 
         <div id="magic-empty-state" class="empty-stage">
           <h3>Ready to Generate Magic Previews</h3>

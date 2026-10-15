@@ -1,5 +1,6 @@
 use crate::config::{
-    AcceleratorMode, GalleryManifest, ProcessOptions, VariantArtifact, default_output_for_input,
+    AcceleratorMode, GalleryManifest, ProcessOptions, ProgressEvent, ProgressSink, VariantArtifact,
+    default_magic_output, default_output_for_input,
 };
 use crate::finish::rerender_variant_from_stored_fits;
 use crate::finish_style::{FinishOptions, FinishPreset, ResolvedFinish};
@@ -17,6 +18,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 
 const INDEX_HTML: &str = include_str!("web/index.html");
@@ -34,6 +36,25 @@ pub enum JobStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogEntry {
+    pub elapsed_ms: u64,
+    pub progress: Option<f32>,
+    pub message: String,
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+}
+
+fn append_log(log: &mut Vec<LogEntry>, started: Option<u64>, event: ProgressEvent<'_>) {
+    if log.len() == 500 { log.remove(0); }
+    log.push(LogEntry {
+        elapsed_ms: now_ms().saturating_sub(started.unwrap_or_else(now_ms)),
+        progress: event.fraction,
+        message: event.message.to_string(),
+    });
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunJob {
     pub id: String,
     pub status: JobStatus,
@@ -44,9 +65,15 @@ pub struct RunJob {
     pub palette: Option<String>,
     pub accelerator: AcceleratorMode,
     pub finish: FinishOptions,
+    pub mix: Option<String>,
+    pub restore: bool,
     pub trim_edges: bool,
     #[serde(default)]
     pub magic_view: bool,
+    pub source: String,
+    pub log: Vec<LogEntry>,
+    pub started_unix_ms: Option<u64>,
+    pub finished_unix_ms: Option<u64>,
     pub warnings: Vec<String>,
     pub error: Option<String>,
     pub manifest: Option<GalleryManifest>,
@@ -57,6 +84,10 @@ struct MagicJob {
     id: String,
     status: JobStatus,
     stage: String,
+    progress: Option<f32>,
+    log: Vec<LogEntry>,
+    started_unix_ms: Option<u64>,
+    finished_unix_ms: Option<u64>,
     error: Option<String>,
     session: Option<serde_json::Value>,
     #[serde(skip)]
@@ -91,6 +122,7 @@ pub struct AppState {
     pub queue_tx: mpsc::UnboundedSender<String>,
     pub output_locks: Arc<Mutex<HashMap<PathBuf, Arc<AsyncMutex<()>>>>>,
     magic_jobs: Arc<Mutex<HashMap<String, MagicJob>>>,
+    watch: Arc<Mutex<Option<crate::watch::FolderWatcher>>>,
     pub local_llm: Option<String>,
 }
 
@@ -102,6 +134,17 @@ impl AppState {
             .clone()
     }
 }
+pub struct ServeConfig {
+    pub bind: String,
+    pub bind_fallback: bool,
+    pub local_llm: Option<String>,
+    pub gallery: Option<PathBuf>,
+    pub open_browser: bool,
+    pub watch: Option<(crate::watch::WatchConfig, ProcessOptions)>,
+}
+
+#[derive(Deserialize)]
+struct InspectRequest { input: String }
 
 #[derive(Debug, Deserialize)]
 pub struct CreateRunRequest {
@@ -144,7 +187,7 @@ struct GalleryMagicRequest {
 #[serde(deny_unknown_fields)]
 struct FileMagicRequest {
     path: String,
-    output: String,
+    output: Option<String>,
     domain: InputDomain,
     transfer: TransferFunction,
     strength: Option<f32>,
@@ -279,6 +322,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/static/app.js", get(serve_js))
         .route("/static/histogram.js", get(serve_histogram_js))
         .route("/api/finish-presets", get(finish_presets))
+        .route("/api/inspect", post(inspect_folder))
+        .route("/api/watch", get(get_watch))
         .route("/api/runs", get(list_runs).post(create_run))
         .route("/api/runs/{id}", get(get_run))
         .route("/api/runs/{id}/gallery", get(get_run_gallery))
@@ -302,22 +347,22 @@ async fn finish_presets() -> Json<[ResolvedFinish; 4]> {
 }
 
 /// Register a finished on-disk gallery as a succeeded job; never queue its input frames.
-fn load_sample_gallery(gallery_dir: &Path) -> Result<RunJob> {
+fn load_gallery(gallery_dir: &Path) -> Result<RunJob> {
     let root = std::fs::canonicalize(gallery_dir)
-        .with_context(|| format!("Cannot open sample gallery '{}'", gallery_dir.display()))?;
+        .with_context(|| format!("Cannot open gallery '{}'", gallery_dir.display()))?;
     if !root.is_dir() {
-        bail!("Sample gallery '{}' is not a directory", root.display());
+        bail!("Gallery '{}' is not a directory", root.display());
     }
     let manifest_path = root.join("manifest.json");
     let raw = std::fs::read_to_string(&manifest_path).with_context(|| {
         format!(
-            "Cannot read sample gallery manifest '{}'",
+            "Cannot read gallery manifest '{}'",
             manifest_path.display()
         )
     })?;
     let mut manifest: GalleryManifest = serde_json::from_str(&raw).with_context(|| {
         format!(
-            "Invalid sample gallery manifest '{}'",
+            "Invalid gallery manifest '{}'",
             manifest_path.display()
         )
     })?;
@@ -325,14 +370,14 @@ fn load_sample_gallery(gallery_dir: &Path) -> Result<RunJob> {
         && Path::new(&manifest.canonical_output).canonicalize().ok().as_deref() != Some(root.as_path())
     {
         bail!(
-            "Sample gallery '{}' has manifest output '{}'; serve the completed gallery at its recorded output path",
+            "Gallery '{}' has manifest output '{}'; serve the completed gallery at its recorded output path",
             root.display(),
             manifest.canonical_output
         );
     }
     if manifest.targets.is_empty() {
         bail!(
-            "Sample gallery '{}' contains no completed targets",
+            "Gallery '{}' contains no completed targets",
             root.display()
         );
     }
@@ -342,7 +387,7 @@ fn load_sample_gallery(gallery_dir: &Path) -> Result<RunJob> {
         }
         if target.variants.is_empty() || target.science_integrations.is_empty() {
             bail!(
-                "Sample gallery target '{}' has no finished variants or integrations",
+                "Gallery target '{}' has no finished variants or integrations",
                 target.target_label
             );
         }
@@ -352,7 +397,7 @@ fn load_sample_gallery(gallery_dir: &Path) -> Result<RunJob> {
             .any(|v| v.id == target.selected_variant)
         {
             bail!(
-                "Sample gallery target '{}' has no selected variant '{}'",
+                "Gallery target '{}' has no selected variant '{}'",
                 target.target_label,
                 target.selected_variant
             );
@@ -361,7 +406,7 @@ fn load_sample_gallery(gallery_dir: &Path) -> Result<RunJob> {
             for asset in [&variant.png_path, &variant.tiff_path] {
                 resolve_safe_gallery_asset(&root, asset).with_context(|| {
                     format!(
-                        "Sample gallery target '{}' has missing or invalid asset '{}'",
+                        "Gallery target '{}' has missing or invalid asset '{}'",
                         target.target_label, asset
                     )
                 })?;
@@ -370,7 +415,7 @@ fn load_sample_gallery(gallery_dir: &Path) -> Result<RunJob> {
         for science in &target.science_integrations {
             resolve_safe_gallery_asset(&root, &science.fits_path).with_context(|| {
                 format!(
-                    "Sample gallery target '{}' has missing or invalid integration '{}'",
+                    "Gallery target '{}' has missing or invalid integration '{}'",
                     target.target_label, science.fits_path
                 )
             })?;
@@ -391,28 +436,29 @@ fn load_sample_gallery(gallery_dir: &Path) -> Result<RunJob> {
         },
         finish: FinishOptions::default(),
         trim_edges: true,
+        mix: None,
+        restore: false,
         magic_view: false,
+        source: "gallery".into(),
+        log: Vec::new(),
+        started_unix_ms: None,
+        finished_unix_ms: None,
         warnings: manifest.warnings.clone(),
         error: None,
         manifest: Some(manifest),
     })
 }
 
-pub async fn serve(
-    bind: &str,
-    local_llm: Option<String>,
-    sample_gallery: Option<PathBuf>,
-) -> Result<()> {
-    let addr = parse_loopback_bind(bind)?;
-    if let Some(llm) = &local_llm {
-        validate_loopback_llm_url(llm)?;
-    }
-    let sample_job = sample_gallery
-        .as_deref()
-        .map(load_sample_gallery)
-        .transpose()
-        .context("Failed to register sample gallery")?;
-
+pub async fn serve(config: ServeConfig) -> Result<()> {
+    let addr = parse_loopback_bind(&config.bind)?;
+    if let Some(llm) = &config.local_llm { validate_loopback_llm_url(llm)?; }
+    // A watched output that already holds a gallery (e.g. after a restart) is shown immediately.
+    let watched_gallery = config.watch.as_ref().map(|(watch, _)| watch.output.clone())
+        .filter(|output| config.gallery.is_none() && output.join("manifest.json").is_file());
+    let gallery_job = config.gallery.as_deref().or(watched_gallery.as_deref()).map(load_gallery).transpose()
+        .context("Failed to register gallery")?;
+    let watcher = config.watch.as_ref().map(|(watch, _)| crate::watch::FolderWatcher::new(watch.clone()))
+        .transpose()?;
     let (queue_tx, mut queue_rx) = mpsc::unbounded_channel::<String>();
     let state = AppState {
         jobs: Arc::new(Mutex::new(HashMap::new())),
@@ -420,50 +466,141 @@ pub async fn serve(
         queue_tx,
         magic_jobs: Arc::new(Mutex::new(HashMap::new())),
         output_locks: Arc::new(Mutex::new(HashMap::new())),
-        local_llm,
+        watch: Arc::new(Mutex::new(watcher)),
+        local_llm: config.local_llm,
     };
-    if let Some(job) = sample_job {
+    if let Some(job) = gallery_job {
         state.job_order.lock().push(job.id.clone());
         state.jobs.lock().insert(job.id.clone(), job);
     }
-
-    // Single active run worker loop
     let worker_state = state.clone();
     tokio::spawn(async move {
-        while let Some(job_id) = queue_rx.recv().await {
-            run_queued_job(&worker_state, &job_id).await;
+        while let Some(id) = queue_rx.recv().await {
+            if worker_state.jobs.lock().get(&id).is_some_and(|job| job.source == "watch") {
+                if let Some(watcher) = worker_state.watch.lock().as_mut() { watcher.set_state("processing"); }
+            }
+            run_queued_job(&worker_state, &id).await;
+            let completed = worker_state.jobs.lock().get(&id).cloned();
+            if let Some(job) = completed.filter(|job| job.source == "watch") {
+                if let Some(watcher) = worker_state.watch.lock().as_mut() {
+                    let record = crate::watch::WatchRunRecord {
+                        run_id: job.manifest.as_ref().filter(|_| job.status == JobStatus::Succeeded).map(|m| m.run_id.clone()),
+                        finished_unix_ms: job.finished_unix_ms.unwrap_or_else(now_ms),
+                        elapsed_ms: job.finished_unix_ms.unwrap_or_else(now_ms)
+                            .saturating_sub(job.started_unix_ms.unwrap_or_else(now_ms)),
+                        ok: job.status == JobStatus::Succeeded,
+                        error: job.error,
+                        frame_files: watcher.snapshot().frame_files,
+                    };
+                    if let Err(err) = watcher.finish(record) {
+                        eprintln!("Watch state could not be saved: {err:#}");
+                        watcher.set_state("error");
+                    }
+                }
+            }
         }
     });
+    if let Some((watch_config, options)) = config.watch {
+        let watch_state = state.clone();
+        tokio::spawn(async move {
+            loop {
+                let handle = watch_state.watch.clone();
+                let polled = tokio::task::spawn_blocking(move || {
+                    let mut guard = handle.lock();
+                    let watcher = guard.as_mut().expect("watcher initialized");
+                    if matches!(watcher.snapshot().state.as_str(), "queued" | "processing") {
+                        Ok(crate::watch::WatchPoll::Unchanged)
+                    } else {
+                        watcher.poll()
+                    }
+                }).await;
+                match polled {
+                    Ok(Ok(crate::watch::WatchPoll::Ready)) => {
+                        let mut watcher = watch_state.watch.lock();
+                        if let Some(watcher) = watcher.as_mut() {
+                            watcher.begin();
+                            watcher.set_state("queued");
+                        }
+                        drop(watcher);
+                        let id = {
+                            let mut order = watch_state.job_order.lock();
+                            let id = format!("job-{}", order.len() + 1);
+                            order.push(id.clone());
+                            id
+                        };
+                        let job = RunJob {
+                            id: id.clone(), status: JobStatus::Queued, stage: "Queued by folder watch".into(),
+                            progress: 0.0, input: watch_config.input.to_string_lossy().into_owned(),
+                            output: watch_config.output.to_string_lossy().into_owned(),
+                            palette: options.palette.clone(), mix: options.mix.clone(), restore: options.restore,
+                            accelerator: options.accelerator, finish: options.finish,
+                            trim_edges: options.trim_edges, magic_view: options.magic_view,
+                            source: "watch".into(), log: Vec::new(), started_unix_ms: None,
+                            finished_unix_ms: None, warnings: Vec::new(), error: None, manifest: None,
+                        };
+                        watch_state.jobs.lock().insert(id.clone(), job);
+                        let _ = watch_state.queue_tx.send(id);
+                    }
+                    Ok(Err(err)) => {
+                        eprintln!("Watch scan failed: {err:#}");
+                        if let Some(w) = watch_state.watch.lock().as_mut() { w.set_state("error"); }
+                    }
+                    Err(err) => eprintln!("Watch scan worker failed: {err}"),
+                    _ => {}
+                }
+                tokio::time::sleep(watch_config.interval).await;
+            }
+        });
+    }
+    let listener = if config.bind_fallback {
+        let mut chosen = None;
+        for port in 8787..=8797 {
+            let attempt = SocketAddr::new(addr.ip(), port);
+            if let Ok(listener) = tokio::net::TcpListener::bind(attempt).await {
+                chosen = Some(listener);
+                break;
+            }
+        }
+        chosen.context("No available loopback port from 8787 through 8797")?
+    } else {
+        tokio::net::TcpListener::bind(addr).await
+            .with_context(|| format!("Failed to bind local web server on '{addr}'"))?
+    };
+    let url = format!("http://{}", listener.local_addr()?);
+    println!("Photonloom web studio listening on {url}");
+    if config.open_browser {
+        if let Err(err) = webbrowser::open(&url) {
+            eprintln!("Could not open a browser: {err}. Open {url} manually.");
+        }
+    }
+    axum::serve(listener, build_router(state)).await.context("Web server terminated unexpectedly")
+}
 
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("Failed to bind local web server on '{addr}'"))?;
-    let local_addr = listener.local_addr()?;
-    println!("Photonloom web gallery listening on http://{local_addr}");
+async fn inspect_folder(headers: HeaderMap, Json(req): Json<InspectRequest>)
+    -> Result<Json<crate::plan::ObservationPlan>, ApiError> {
+    check_same_origin_write(&headers)?;
+    if req.input.trim().is_empty() { return Err(api_error(StatusCode::BAD_REQUEST, "Input path is required")); }
+    let path = PathBuf::from(req.input.trim());
+    tokio::task::spawn_blocking(move || crate::plan::inspect(&path)).await
+        .map_err(|err| api_error(StatusCode::INTERNAL_SERVER_ERROR, err))?
+        .map(Json).map_err(|err| api_error(StatusCode::BAD_REQUEST, format!("{err:#}")))
+}
 
-    axum::serve(listener, build_router(state))
-        .await
-        .context("Web server terminated unexpectedly")
+async fn get_watch(State(state): State<AppState>) -> Json<Option<crate::watch::WatchSnapshot>> {
+    Json(state.watch.lock().as_ref().map(crate::watch::FolderWatcher::snapshot))
 }
 
 async fn run_queued_job(state: &AppState, job_id: &str) {
-    let (input_str, output_str, palette, accelerator, finish, trim_edges, magic_view) = {
+    let (input_str, output_str, palette, mix, restore, accelerator, finish, trim_edges, magic_view) = {
         let mut jobs = state.jobs.lock();
-        let Some(job) = jobs.get_mut(job_id) else {
-            return;
-        };
+        let Some(job) = jobs.get_mut(job_id) else { return };
         job.status = JobStatus::Running;
-        job.stage = "Starting run".to_string();
+        job.stage = "Starting run".into();
         job.progress = 0.01;
-        (
-            job.input.clone(),
-            job.output.clone(),
-            job.palette.clone(),
-            job.accelerator,
-            job.finish,
-            job.trim_edges,
-            job.magic_view,
-        )
+        job.started_unix_ms = Some(now_ms());
+        append_log(&mut job.log, job.started_unix_ms, ProgressEvent { message: "Starting run", fraction: Some(0.01) });
+        (job.input.clone(), job.output.clone(), job.palette.clone(), job.mix.clone(), job.restore,
+            job.accelerator, job.finish, job.trim_edges, job.magic_view)
     };
 
     let input_path = PathBuf::from(&input_str);
@@ -476,6 +613,8 @@ async fn run_queued_job(state: &AppState, job_id: &str) {
                     job.status = JobStatus::Failed;
                     job.stage = "Failed".to_string();
                     job.error = Some(format!("{err:#}"));
+                    job.finished_unix_ms = Some(now_ms());
+                    append_log(&mut job.log, job.started_unix_ms, ProgressEvent { message: &format!("{err:#}"), fraction: None });
                 }
                 return;
             }
@@ -491,6 +630,8 @@ async fn run_queued_job(state: &AppState, job_id: &str) {
                 job.status = JobStatus::Failed;
                 job.stage = "Failed".into();
                 job.error = Some(format!("{err:#}"));
+                job.finished_unix_ms = Some(now_ms());
+                append_log(&mut job.log, job.started_unix_ms, ProgressEvent { message: &format!("{err:#}"), fraction: None });
             }
             return;
         }
@@ -507,19 +648,22 @@ async fn run_queued_job(state: &AppState, job_id: &str) {
 
     let jobs_arc = state.jobs.clone();
     let jid = job_id.to_string();
-    let progress_cb = Arc::new(move |stage: &str, pct: f32| {
+    let progress_cb = Arc::new(move |event: crate::config::ProgressEvent<'_>| {
         let mut jobs = jobs_arc.lock();
         if let Some(job) = jobs.get_mut(&jid) {
-            job.stage = stage.to_string();
-            job.progress = pct;
+            if let Some(pct) = event.fraction {
+                job.stage = event.message.to_string();
+                job.progress = pct;
+            }
+            append_log(&mut job.log, job.started_unix_ms, event);
         }
     });
 
     let options = ProcessOptions {
         accelerator,
         palette,
-        mix: None,
-        restore: false,
+        mix,
+        restore,
         finish,
         trim_edges,
         magic_view,
@@ -533,6 +677,7 @@ async fn run_queued_job(state: &AppState, job_id: &str) {
 
     let mut jobs = state.jobs.lock();
     if let Some(job) = jobs.get_mut(job_id) {
+        job.finished_unix_ms = Some(now_ms());
         match res {
             Ok(Ok(manifest)) => {
                 job.status = JobStatus::Succeeded;
@@ -553,6 +698,10 @@ async fn run_queued_job(state: &AppState, job_id: &str) {
                 job.error = Some(format!("Worker panicked: {join_err}"));
             }
         }
+        let message = job.error.clone().unwrap_or_else(|| job.stage.clone());
+        append_log(&mut job.log, job.started_unix_ms, ProgressEvent {
+            message: &message, fraction: (job.status == JobStatus::Succeeded).then_some(1.0),
+        });
     }
 }
 
@@ -650,9 +799,15 @@ async fn create_run(
         output: req.output.unwrap_or_default(),
         palette: req.palette,
         accelerator: req.accelerator.unwrap_or_default(),
+        mix: req.mix,
+        restore: req.restore.unwrap_or(false),
         finish: req.finish.unwrap_or_default(),
         trim_edges: req.trim_edges.unwrap_or(true),
         magic_view: req.magic_view,
+        source: "manual".into(),
+        log: Vec::new(),
+        started_unix_ms: None,
+        finished_unix_ms: None,
         warnings: Vec::new(),
         error: None,
         manifest: None,
@@ -997,18 +1152,35 @@ fn new_magic_job(state: &AppState, gallery_run: Option<String>) -> MagicJob {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let id = format!("magic-job-{}", NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
     let job = MagicJob { id: id.clone(), status: JobStatus::Queued, stage: "Waiting for output lock".into(),
+        progress: None, log: Vec::new(), started_unix_ms: None, finished_unix_ms: None,
         error: None, session: None, session_path: None, gallery_run };
     state.magic_jobs.lock().insert(id, job.clone());
     job
 }
 
-async fn run_magic_analysis(state: AppState, job: MagicJob, source: MagicSource, output: PathBuf, options: MagicOptions, strength: f32) {
+fn magic_progress(state: &AppState, id: &str) -> ProgressSink {
+    let jobs = state.magic_jobs.clone();
+    let id = id.to_string();
+    ProgressSink(Some(Arc::new(move |event: ProgressEvent<'_>| {
+        if let Some(job) = jobs.lock().get_mut(&id) {
+            if let Some(pct) = event.fraction {
+                job.stage = event.message.to_string();
+                job.progress = Some(pct);
+            }
+            append_log(&mut job.log, job.started_unix_ms, event);
+        }
+    })))
+}
+
+async fn run_magic_analysis(state: AppState, job: MagicJob, source: MagicSource, output: PathBuf, mut options: MagicOptions, strength: f32) {
     let lock = state.get_output_lock(&output);
     let _guard = lock.lock().await;
     if let Some(entry) = state.magic_jobs.lock().get_mut(&job.id) {
         entry.status = JobStatus::Running;
         entry.stage = "Analyzing source and generating three previews".into();
+        entry.started_unix_ms = Some(now_ms());
     }
+    options.progress = magic_progress(&state, &job.id);
     let result = tokio::task::spawn_blocking(move || {
         if let MagicSource::Gallery { gallery, target_id, palette } = &source {
             let (selected, selected_palette) = gallery_selection(gallery, Some(target_id), Some(palette))
@@ -1023,6 +1195,7 @@ async fn run_magic_analysis(state: AppState, job: MagicJob, source: MagicSource,
     }).await;
     let mut jobs = state.magic_jobs.lock();
     if let Some(entry) = jobs.get_mut(&job.id) {
+        entry.finished_unix_ms = Some(now_ms());
         match result {
             Ok(Ok(session)) => {
                 entry.status = JobStatus::Succeeded;
@@ -1033,6 +1206,10 @@ async fn run_magic_analysis(state: AppState, job: MagicJob, source: MagicSource,
             Ok(Err(e)) => { entry.status = JobStatus::Failed; entry.stage = "Magic View failed".into(); entry.error = Some(format!("{e:#}")); }
             Err(e) => { entry.status = JobStatus::Failed; entry.stage = "Magic View failed".into(); entry.error = Some(format!("Worker failed: {e}")); }
         }
+        let message = entry.error.clone().unwrap_or_else(|| entry.stage.clone());
+        append_log(&mut entry.log, entry.started_unix_ms, ProgressEvent {
+            message: &message, fraction: (entry.status == JobStatus::Succeeded).then_some(1.0),
+        });
     }
 }
 
@@ -1042,14 +1219,18 @@ async fn start_magic_render(state: AppState, job: MagicJob, path: PathBuf, outpu
     if let Some(entry) = state.magic_jobs.lock().get_mut(&job.id) {
         entry.status = JobStatus::Running;
         entry.stage = "Rendering full-resolution Magic variant".into();
+        entry.started_unix_ms = Some(now_ms());
     }
+    let progress = magic_progress(&state, &job.id);
     let result = tokio::task::spawn_blocking(move || {
         let mut session = magic::open(&path)?;
+        session.progress = progress;
         magic::render(&mut session, variant, strength)?;
         Ok::<_, anyhow::Error>(session)
     }).await;
     let mut jobs = state.magic_jobs.lock();
     if let Some(entry) = jobs.get_mut(&job.id) {
+        entry.finished_unix_ms = Some(now_ms());
         match result {
             Ok(Ok(session)) => {
                 entry.status = JobStatus::Succeeded;
@@ -1067,6 +1248,10 @@ async fn start_magic_render(state: AppState, job: MagicJob, path: PathBuf, outpu
             Ok(Err(e)) => { entry.status = JobStatus::Failed; entry.stage = "Full render failed".into(); entry.error = Some(format!("{e:#}")); }
             Err(e) => { entry.status = JobStatus::Failed; entry.stage = "Full render failed".into(); entry.error = Some(format!("Worker failed: {e}")); }
         }
+        let message = entry.error.clone().unwrap_or_else(|| entry.stage.clone());
+        append_log(&mut entry.log, entry.started_unix_ms, ProgressEvent {
+            message: &message, fraction: (entry.status == JobStatus::Succeeded).then_some(1.0),
+        });
     }
 }
 
@@ -1105,8 +1290,12 @@ async fn post_file_magic(State(state): State<AppState>, headers: HeaderMap,
     let strength = magic_strength(req.strength.unwrap_or(0.5))?;
     let path = std::fs::canonicalize(&req.path).map_err(magic_error)?;
     if !path.is_file() { return Err(magic_error("Input must be a regular file")); }
-    if req.output.trim().is_empty() { return Err(magic_error("Output directory is required")); }
-    let output = crate::config::resolve_prospective_path(Path::new(&req.output)).map_err(magic_error)?;
+    let output = if let Some(value) = req.output.as_deref().filter(|s| !s.trim().is_empty()) {
+        PathBuf::from(value)
+    } else {
+        default_magic_output(&path).map_err(magic_error)?
+    };
+    let output = crate::config::resolve_prospective_path(&output).map_err(magic_error)?;
     let job = new_magic_job(&state, None);
     let mut options = req.options.unwrap_or_default();
     options.planner_strength = strength;

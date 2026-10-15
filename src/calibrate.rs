@@ -178,6 +178,26 @@ fn compatible_exposure_5pct(ea: Option<f32>, eb: Option<f32>) -> bool {
     }
 }
 
+/// Metadata-only calibration availability using the same master matching rules as calibration.
+pub(crate) fn matching_counts(light: &FrameMeta, frames: &[FrameMeta]) -> (usize, usize, usize, usize) {
+    let bias = frames.iter().filter(|f| f.role == FrameRole::Bias
+        && same_geometry_and_sensor(f, light) && compatible_gain(f, light)).count();
+    let darks = frames.iter().filter(|f| f.role == FrameRole::Dark
+        && same_geometry_and_sensor(f, light) && compatible_gain(f, light)
+        && compatible_temp(f, light)
+        && (compatible_exposure_5pct(f.exposure, light.exposure)
+            || (f.exposure.unwrap_or(0.0) > 0.0 && light.exposure.unwrap_or(0.0) > 0.0
+                && (light.format == FileFormat::Raw || bias > 0)))).count();
+    let flats: Vec<_> = frames.iter().filter(|f| f.role == FrameRole::Flat
+        && same_geometry_and_sensor(f, light)
+        && (f.channel == light.channel || (light.channel == Some(Channel::RgbCfa) && f.bayer.is_some()))).collect();
+    let flat_darks = flats.first().map_or(0, |flat| frames.iter().filter(|f|
+        f.role == FrameRole::FlatDark && same_geometry_and_sensor(f, light)
+        && compatible_gain(f, flat) && compatible_temp(f, flat)
+        && compatible_exposure_5pct(f.exposure, flat.exposure)).count());
+    (bias, darks, flats.len(), flat_darks)
+}
+
 /// Combines calibration frames into a master using median combination with 3-MAD outlier rejection for >= 3 frames.
 pub fn combine_calibration_frames(frames: &[FrameMeta]) -> Result<LinearImage> {
     if frames.is_empty() {
@@ -570,6 +590,8 @@ pub fn calibrate_target_group(
         summary.missing_masters.push("bias".to_string());
         None
     };
+    options.report_detail(&format!("{} · {}: bias {} (gain/ISO ±2%; RAW uses camera black level)",
+        group.target_label, channel, compatible_biases.len()));
 
     // 2. Precompute FlatDark and Flat masters per channel
     let all_flat_darks: Vec<FrameMeta> = calibration_frames
@@ -717,6 +739,12 @@ pub fn calibrate_target_group(
             summary.missing_masters.push(format!("dark ({channel})"));
             DarkMode::None
         };
+        options.report_detail(&format!(
+            "{} · {} calibration: flats {} · flat-darks {} · exact darks {} · scalable darks {} · missing {}; geometry/sensor/binning matched, dark gain ±2%, temperature ±2°C, exposure ±5%",
+            group.target_label, channel, channel_flats.len(), summary.used_flat_darks.len(),
+            exact_darks.len(), scalable_darks.len(),
+            if summary.missing_masters.is_empty() { "none".to_string() } else { summary.missing_masters.join(", ") }
+        ));
 
         // Restrict in-flight full-resolution images (including repair buffers)
         // independently of the global Rayon worker count. Masters are shared
@@ -724,7 +752,7 @@ pub fn calibrate_target_group(
         let batch_size =
             max_parallel_frames(first_light.width, first_light.height, first_light.channels);
         let mut spooled_vec = Vec::with_capacity(lights.len());
-        let stage = format!("Calibrating {channel}");
+        let stage = format!("Calibrating {} · {}", group.target_label, channel);
         let mut progress = PhaseProgress::new(options, &stage, lights.len(), progress_range);
         for batch in lights.chunks(batch_size).enumerate() {
             let (batch_idx, lights_batch) = batch;

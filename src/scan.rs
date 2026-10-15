@@ -55,6 +55,11 @@ fn classify_extension(path: &Path) -> Option<FileFormat> {
     }
 }
 
+/// True when `path` has a FITS or camera RAW extension the scanner ingests.
+pub fn is_supported_frame_path(path: &Path) -> bool {
+    classify_extension(path).is_some()
+}
+
 fn extract_folder_role(root: &Path, path: &Path) -> Result<Option<FrameRole>> {
     let rel = path.strip_prefix(root).unwrap_or(path);
     let mut found: Option<(FrameRole, String)> = None;
@@ -246,13 +251,21 @@ pub fn scan_detailed(input: &Path) -> Result<ScanReport> {
     let mut frames = Vec::with_capacity(candidate_paths.len());
     let mut light_frames = Vec::new();
     let mut calibration_frames = Vec::new();
+    let mut rejected_frames = Vec::new();
 
     for (path, fmt) in candidate_paths {
         let frame = match fmt {
             FileFormat::Fits => {
-                let meta = fits::inspect_fits_header(&path).with_context(|| {
-                    format!("Unreadable or invalid FITS file '{}'", path.display())
-                })?;
+                let meta = match fits::inspect_fits_header(&path) {
+                    Ok(meta) => meta,
+                    Err(error) => {
+                        rejected_frames.push(RejectedFrameRecord {
+                            path: path.display().to_string(),
+                            reason: format!("Unreadable or invalid FITS header: {error:#}"),
+                        });
+                        continue;
+                    }
+                };
                 let role = resolve_role(input, &path, meta.imagetyp.as_deref())?;
                 let header_channel = match &meta.filter {
                     Some(f) => {
@@ -292,9 +305,16 @@ pub fn scan_detailed(input: &Path) -> Result<ScanReport> {
                 fits::build_fits_frame(&path, meta, role, channel)
             }
             FileFormat::Raw => {
-                let meta = raw::inspect_raw_header(&path).with_context(|| {
-                    format!("Unreadable or unsupported RAW file '{}'", path.display())
-                })?;
+                let meta = match raw::inspect_raw_header(&path) {
+                    Ok(meta) => meta,
+                    Err(error) => {
+                        rejected_frames.push(RejectedFrameRecord {
+                            path: path.display().to_string(),
+                            reason: format!("Unreadable or unsupported RAW header: {error:#}"),
+                        });
+                        continue;
+                    }
+                };
                 let role = resolve_role(input, &path, None)?;
                 let path_channel = extract_path_channel(input, &path);
                 let channel = match role {
@@ -332,7 +352,7 @@ pub fn scan_detailed(input: &Path) -> Result<ScanReport> {
         light_frames,
         calibration_frames,
         warnings: Vec::new(),
-        rejected_frames: Vec::new(),
+        rejected_frames,
     })
 }
 

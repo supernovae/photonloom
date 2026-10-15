@@ -8,7 +8,7 @@ pub mod recipes;
 pub mod source;
 pub mod validate;
 
-use crate::config::{GalleryManifest, MagicDecisionRef, VariantArtifact};
+use crate::config::{GalleryManifest, MagicDecisionRef, ProgressSink, VariantArtifact};
 use crate::crop::CropRect;
 use crate::finish::{generate_static_gallery_html, write_variant_images};
 use anyhow::{Context, Result, ensure};
@@ -51,11 +51,13 @@ pub struct MagicOptions {
     pub starless: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub star_blend: Option<f32>,
+    #[serde(skip)]
+    pub progress: ProgressSink,
 }
 impl Default for MagicOptions {
     fn default() -> Self {
         Self { crop: true, catalog_online: false, magic_llm: None, magic_learn: false, proposal: None,
-            planner_variant: MagicVariant::Enhanced, planner_strength: 0.5, starless: false, star_blend: None }
+            planner_variant: MagicVariant::Enhanced, planner_strength: 0.5, starless: false, star_blend: None, progress: ProgressSink::default() }
     }
 }
 
@@ -146,6 +148,8 @@ pub struct MagicSession {
     pub analysis: analysis::ImageAnalysis,
     pub previews: Vec<MagicCandidate>,
     pub artifacts: Vec<VariantArtifact>,
+    #[serde(skip)]
+    pub progress: ProgressSink,
 }
 fn persist(session: &MagicSession) -> Result<()> {
     crate::atomic_write_file(&session.session_path, &serde_json::to_vec_pretty(session)?)
@@ -167,14 +171,21 @@ pub fn analyze(source: &MagicSource, options: &MagicOptions, output: &Path) -> R
     ensure!(options.proposal.is_none() || (options.magic_llm.is_none() && !options.magic_learn),
         "Explicit Magic parameters conflict with local planner or preference learning");
     if let Some(url) = &options.magic_llm { crate::models::validate_loopback_llm_url(url)?; }
+    options.progress.stage("Magic · loading source", 0.0);
     let src = source::load_preview(source, options.crop)?;
     let output = crate::config::resolve_prospective_path(output)?;
     let dir = output.join("magic").join(&src.digest).join(&src.target_id);
     std::fs::create_dir_all(&dir)?;
+    options.progress.stage("Magic · measuring preview", 0.1);
     let (mut analysis, masks) = analysis::analyze_image(&src.baseline, src.domain);
     analysis.stars.original_to_preview_scale = Some(src.baseline.width as f32 / src.native_dimensions[0] as f32);
     let subject = crate::catalog::resolve_subject(src.subject_wcs.as_ref(), src.native_dimensions, &src.title, options.catalog_online);
+    let measured = |value: Option<f32>, unit: &str| value.map_or_else(|| "n/a".to_string(), |v| format!("{v:.4}{unit}"));
+    options.progress.detail(&format!("Magic · sky MAD σ {}, median FWHM {}, {} stars",
+        measured(analysis.noise.sky_mad_sigma, ""), measured(analysis.stars.median_fwhm, " px"), analysis.stars.unsaturated.len()));
     if let Some(name) = &subject.selected { analysis.structure.subject = Some(name.clone()); }
+    options.progress.detail(&format!("Magic · subject {}, catalog class {}, score {:.2}",
+        subject.selected.as_deref().unwrap_or("unidentified (no WCS/catalog match)"), subject.class.as_str(), subject.score));
     let class = subject.selected.as_ref().map(|_| subject.class.as_str());
     let (recipe, _) = recipes::select(class, &analysis, &src.channels_used);
     recipe.validate()?;
@@ -224,7 +235,7 @@ pub fn analyze(source: &MagicSource, options: &MagicOptions, output: &Path) -> R
         subject: Some(subject), catalog_online: options.catalog_online,
         proposal, planner_warning, magic_learn: options.magic_learn, preference_prior, preference_variant,
         starless: options.starless, star_blend: options.star_blend,
-        analysis, previews: Vec::new(), artifacts: Vec::new(),
+        analysis, previews: Vec::new(), artifacts: Vec::new(), progress: options.progress.clone(),
     };
     if session.session_path.exists() {
         let previous: MagicSession = serde_json::from_slice(&std::fs::read(&session.session_path)?)?;
@@ -245,6 +256,7 @@ pub fn analyze(source: &MagicSource, options: &MagicOptions, output: &Path) -> R
         }
     }
     save_masks(&dir, &mut session.analysis, &masks)?;
+    if let Some(warning) = &session.planner_warning { session.progress.detail(warning); }
     persist(&session)?;
     Ok(session)
 }
@@ -314,6 +326,18 @@ fn candidate(
     let optimized = result.report.winner_parameters;
     let mut optimized_image = Some(result.image);
     let search = result.report;
+    let passed_trials = search.trials.iter().filter(|trial| trial.quality.passed).count();
+    let mut causes = std::collections::BTreeMap::<&str, usize>::new();
+    for cause in search.trials.iter().flat_map(|trial| trial.rejection_causes.iter()) {
+        *causes.entry(cause.as_str()).or_default() += 1;
+    }
+    let best = search.trials.iter().filter(|trial| trial.quality.passed).map(|trial| trial.objective).fold(f32::NAN, f32::max);
+    session.progress.detail(&format!("Magic · {} ({:.0}%): {} trials, {} passed gates, best score {}{}",
+        variant.as_str(), strength * 100.0, search.trials.len(), passed_trials,
+        if best.is_nan() { "n/a".to_string() } else { format!("{best:.3}") },
+        if causes.is_empty() { String::new() } else {
+            format!("; rejections: {}", causes.iter().map(|(cause, n)| format!("{cause} ×{n}")).collect::<Vec<_>>().join(", "))
+        }));
     let mut attempts = Vec::new();
     let mut selected = working_base.clone();
     let mut actual = operators::OperatorParams::default();
@@ -325,6 +349,10 @@ fn candidate(
             else { operators::apply_candidate(working_base, &analysis, &masks, &params) };
         let quality = validate::validate_candidate(working_base, &image, &analysis, &masks);
         let passed = quality.passed;
+        if backoff < 1.0 || !passed {
+            session.progress.detail(&format!("Magic · {} backoff {:.2}×: {}",
+                variant.as_str(), backoff, if passed { "passed gates" } else { "rejected by quality gates" }));
+        }
         attempts.push(MagicAttempt { backoff, quality });
         if passed {
             selected = image;
@@ -407,6 +435,7 @@ fn relative(session: &MagicSession, path: &Path) -> Result<String> {
 }
 pub fn preview(session: &mut MagicSession, strength: f32) -> Result<Vec<MagicCandidate>> {
     sane_strength(strength)?;
+    session.progress.stage("Magic · loading preview", 0.05);
     let src = loaded(session)?;
     let dir = session.session_path.parent().context("Session has no parent")?;
     let star_blend_opt = effective_star_blend(session.starless, session.star_blend)?;
@@ -417,12 +446,15 @@ pub fn preview(session: &mut MagicSession, strength: f32) -> Result<Vec<MagicCan
     };
     let mut results = Vec::new();
     for variant in [MagicVariant::Natural, MagicVariant::Enhanced, MagicVariant::Dramatic] {
+        session.progress.stage(&format!("Magic · optimizing {} preview ({:.0}%)", variant.as_str(), strength * 100.0),
+            (results.len() as f32 + 0.1) / 3.0);
         let (image, decision) = candidate(session, &src, variant, strength, shared_sep.as_ref())?;
         let name = id(session, variant, strength);
         let png = dir.join(format!("{name}-preview.png"));
         let preview_tiff = dir.join(format!("{name}-preview.tiff"));
         write_variant_images(&image, &preview_tiff, &png)?;
         let item = MagicCandidate { variant, strength, preview_path: relative(session, &png)?, decision };
+        session.progress.stage(&format!("Magic · preview {} written", variant.as_str()), (results.len() + 1) as f32 / 3.0);
         session.previews.retain(|c| c.variant != variant || c.strength != strength);
         session.previews.push(item.clone());
         results.push(item);
@@ -474,12 +506,15 @@ fn render_native(
     let tiles = source::NativeTiles::from_preview(&session.source, session.crop.is_some(), source)?;
     let model = source::NativeBaselineModel::fit(&session.source, session.crop.is_some(), source)?;
     let mut baseline = source::BaselineScratch::create(dir, width, height)?;
+    let total_tiles = width.div_ceil(512) * height.div_ceil(512);
     for y in (0..height).step_by(512) {
         for x in (0..width).step_by(512) {
             let w = (width - x).min(512);
             let h = (height - y).min(512);
             let tile = model.apply(tiles.read_tile(x, y, w, h)?, x, y)?;
             baseline.write_tile(x, y, &tile)?;
+            session.progress.stage(&format!("Magic · preparing full-resolution tiles ({}/{})",
+                (y / 512) * width.div_ceil(512) + x / 512 + 1, total_tiles), 0.1);
         }
     }
     let star_blend_opt = effective_star_blend(session.starless, session.star_blend)?;
@@ -580,14 +615,18 @@ fn render_native(
                     }
                 }
                 output.write_tile(x, y, &center)?;
+                session.progress.stage(&format!("Magic · rendering tiles ({}/{})",
+                    (y / 512) * width.div_ceil(512) + x / 512 + 1, total_tiles), 0.4 + 0.5 * ((y / 512) * width.div_ceil(512) + x / 512 + 1) as f32 / total_tiles as f32);
             }
             if rejected.is_some() { break; }
         }
         if let Some(quality) = rejected {
             attempts.push(MagicAttempt { backoff, quality });
+            session.progress.detail(&format!("Magic · native backoff {backoff:.2}× rejected by quality gates"));
             continue;
         }
         attempts.push(MagicAttempt { backoff, quality: successful_quality.context("Native quality summary unavailable")? });
+        session.progress.detail(&format!("Magic · native backoff {backoff:.2}× passed quality gates"));
         decision.actual = params;
         decision.attempts.extend(attempts);
         decision.explanation = if backoff == 0.0 {
@@ -604,6 +643,7 @@ fn render_native(
 
 pub fn render(session: &mut MagicSession, variant: MagicVariant, strength: f32) -> Result<VariantArtifact> {
     sane_strength(strength)?;
+    session.progress.stage(&format!("Magic · rendering {} at {:.0}%", variant.as_str(), strength * 100.0), 0.1);
     let mut src = loaded(session)?;
     let (_, mut decision) = candidate(session, &src, variant, strength, None)?;
     let dir = session.session_path.parent().context("Session has no parent")?;
@@ -653,6 +693,8 @@ pub fn render(session: &mut MagicSession, variant: MagicVariant, strength: f32) 
             persist(session)?;
         }
     }
+    session.progress.detail(&format!("Magic · rendered {}: {} and {}", variant.as_str(), tiff.display(), png.display()));
+    session.progress.stage("Magic · render complete", 1.0);
     Ok(artifact)
 }
 fn publish_gallery(session: &MagicSession, artifact: &VariantArtifact) -> Result<()> {

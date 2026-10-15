@@ -260,6 +260,9 @@ pub fn integrate_target_channels(
         None
     };
 
+    options.report_detail(&format!("Integration · {} accelerator{}",
+        if gpu_stacker.is_some() { "GPU" } else { "CPU" },
+        gpu_stacker.as_ref().map_or(String::new(), |gpu| format!(" · adapter {}", gpu.adapter_name))));
     // Calibration and demosaicing preserve native pixel geometry. Do not attach WCS
     // if the selected original has different dimensions or is not a FITS light.
     let original_wcs = |frame: &crate::config::Frame| {
@@ -312,6 +315,8 @@ pub fn integrate_target_channels(
                     recommended_crop: None,
                 },
             );
+            options.report_detail(&format!("{} · {}: single light accepted, 0 rejected; no registration needed",
+                target_label, channel));
             continue;
         }
 
@@ -396,8 +401,21 @@ pub fn integrate_target_channels(
         };
         let ref_stars = qualities[ref_idx].as_ref().unwrap().stars.clone();
 
+        if options.progress.is_some() {
+            let accepted_quality: Vec<_> = qualities.iter().flatten().collect();
+            let mut fwhm: Vec<f32> = accepted_quality.iter().map(|q| q.median_fwhm).collect();
+            let mut eccentricity: Vec<f32> = accepted_quality.iter().map(|q| q.median_eccentricity).collect();
+            fwhm.sort_by(f32::total_cmp);
+            eccentricity.sort_by(f32::total_cmp);
+            let star_range = accepted_quality.iter().map(|q| q.star_count).min().unwrap_or(0)
+                ..= accepted_quality.iter().map(|q| q.star_count).max().unwrap_or(0);
+            options.report_detail(&format!("{} · {} quality: {} accepted, {} rejected; median FWHM {:.2} px, eccentricity {:.2}, stars {}–{}",
+                target_label, channel, accepted_quality.len(), ch_rejected.len(),
+                fwhm[fwhm.len()/2], eccentricity[eccentricity.len()/2], star_range.start(), star_range.end()));
+        }
         // Register all remaining frames against ref_stars
         let mut registered_subs: Vec<RegisteredSub> = Vec::with_capacity(spooled_frames.len());
+        let mut rms_values = Vec::new();
         for (idx, sf) in spooled_frames.iter().enumerate() {
             let Some(q) = &qualities[idx] else {
                 continue;
@@ -415,6 +433,7 @@ pub fn integrate_target_channels(
                         spooled: sf.clone(),
                         transform: m.transform,
                     });
+                    if options.progress.is_some() { rms_values.push(m.rms); }
                 }
                 Err(err) => {
                     let rec = RejectedFrameRecord {
@@ -454,6 +473,16 @@ pub fn integrate_target_channels(
             }
         }
         let overlap_frac = (common_overlap as f32) / ((grid_steps * grid_steps) as f32);
+        if options.progress.is_some() {
+            rms_values.sort_by(f32::total_cmp);
+            options.report_detail(&format!("{} · {} registration: {}/{} registered; median RMS {:.2} px, max RMS {:.2} px, overlap {:.1}%",
+                target_label, channel, registered_subs.len(), spooled_frames.len(),
+                rms_values.get(rms_values.len()/2).copied().unwrap_or(0.0),
+                rms_values.last().copied().unwrap_or(0.0), overlap_frac * 100.0));
+            for rejected in &ch_rejected {
+                options.report_detail(&format!("Rejected {}: {}", rejected.path, rejected.reason));
+            }
+        }
         if overlap_frac < 0.50 {
             bail!(
                 "Target '{}' channel {}: common overlap across registered frames is {:.1}% (< 50% minimum)",
@@ -507,6 +536,9 @@ pub fn integrate_target_channels(
         let mut tile_values_buf = Vec::new();
         let mut tile_masks_u32_buf = Vec::new();
         let total_tiles = width.div_ceil(tile_dim) * height.div_ceil(tile_dim) * channels_count;
+        options.report_detail(&format!("{} · {} integration: {} tiles, {} frames, {:.0}s total exposure; {}",
+            target_label, channel, total_tiles, num_reg, total_exposure_s,
+            gpu_stacker.as_ref().map_or("CPU".to_string(), |gpu| format!("GPU {}", gpu.adapter_name))));
         let stage = format!("Integrating {channel} ({num_reg} frames, {tile_dim}px tiles)");
         let mut tile_progress = PhaseProgress::new(
             options,

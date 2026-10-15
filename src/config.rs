@@ -26,7 +26,39 @@ impl fmt::Display for AcceleratorMode {
     }
 }
 
-pub type ProgressCallback = Arc<dyn Fn(&str, f32) + Send + Sync>;
+/// One progress notification. `fraction: Some(f)` advances the run's stage and bar;
+/// `fraction: None` is a detail/measurement line that only appends to activity logs.
+#[derive(Debug, Clone, Copy)]
+pub struct ProgressEvent<'a> {
+    pub message: &'a str,
+    pub fraction: Option<f32>,
+}
+
+pub type ProgressCallback = Arc<dyn Fn(ProgressEvent<'_>) + Send + Sync>;
+
+/// A progress callback that can be retained in serializable Magic options and sessions.
+#[derive(Clone, Default)]
+pub struct ProgressSink(pub Option<ProgressCallback>);
+
+impl fmt::Debug for ProgressSink {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("ProgressSink").field(&self.0.is_some()).finish()
+    }
+}
+
+impl ProgressSink {
+    pub fn stage(&self, message: &str, fraction: f32) {
+        if let Some(callback) = &self.0 {
+            callback(ProgressEvent { message, fraction: Some(fraction.clamp(0.0, 1.0)) });
+        }
+    }
+
+    pub fn detail(&self, message: &str) {
+        if let Some(callback) = &self.0 {
+            callback(ProgressEvent { message, fraction: None });
+        }
+    }
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ProcessOptions {
@@ -81,7 +113,14 @@ impl fmt::Debug for ProcessOptions {
 impl ProcessOptions {
     pub fn report_progress(&self, stage: &str, fraction: f32) {
         if let Some(cb) = &self.progress {
-            cb(stage, fraction.clamp(0.0, 1.0));
+            cb(ProgressEvent { message: stage, fraction: Some(fraction.clamp(0.0, 1.0)) });
+        }
+    }
+
+    /// Emits a measurement/detail line without moving the stage or progress bar.
+    pub fn report_detail(&self, message: &str) {
+        if let Some(cb) = &self.progress {
+            cb(ProgressEvent { message, fraction: None });
         }
     }
 }
@@ -128,7 +167,7 @@ impl<'a> PhaseProgress<'a> {
         let remaining = elapsed * self.total.saturating_sub(completed) as f64 / completed as f64;
         let seconds = remaining.ceil() as u64;
         let message = format!(
-            "{}: {}/{} — phase ETA {}m {:02}s",
+            "{} ({}/{}) — ETA {}m {:02}s",
             self.stage,
             completed,
             self.total,
@@ -707,6 +746,8 @@ pub struct GalleryManifest {
     pub canonical_input: String,
     pub canonical_output: String,
     pub created_at_unix_ms: u64,
+    #[serde(default)]
+    pub elapsed_ms: u64,
     pub accelerator_requested: String,
     pub accelerator_used: String,
     pub targets: Vec<TargetGallery>,
@@ -729,6 +770,24 @@ pub fn default_output_for_input(input: &Path) -> Result<PathBuf> {
         .unwrap_or("observations");
     let parent = canonical_in.parent().unwrap_or_else(|| Path::new("."));
     Ok(parent.join(format!("{name}-photonloom")))
+}
+
+/// Default Magic View output: a gallery directory finishes in place; a standalone image
+/// writes to sibling `<stem>-magic`.
+pub fn default_magic_output(input: &Path) -> Result<PathBuf> {
+    let canonical_in = std::fs::canonicalize(input).with_context(|| {
+        format!("Magic input '{}' does not exist or cannot be resolved", input.display())
+    })?;
+    if canonical_in.is_dir() {
+        return Ok(canonical_in);
+    }
+    let stem = canonical_in
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("image");
+    let parent = canonical_in.parent().unwrap_or_else(|| Path::new("."));
+    Ok(parent.join(format!("{stem}-magic")))
 }
 
 /// Resolves canonical path even if the final leaf(s) do not exist yet, following symlinks on existing ancestors.

@@ -1,0 +1,73 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: photonloom-watch
+  labels:
+    app.kubernetes.io/name: photonloom
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate # Never overlap two watchers writing the same results directory.
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: photonloom
+      app.kubernetes.io/component: watch
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: photonloom
+        app.kubernetes.io/component: watch
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: photonloom
+          image: ghcr.io/supernovae/photonloom:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - photonloom
+            - serve
+            - --watch
+            - /observations
+            - --output
+            - /results
+            - --bind
+            - 127.0.0.1:8787
+          # Deliberately loopback-only: do not expose a Service. kubectl port-forward
+          # deploy/photonloom-watch 8787:8787 reaches the pod's loopback listener.
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: "1"
+              memory: "1Gi"
+            limits:
+              cpu: "4"
+              memory: "2Gi"
+          volumeMounts:
+            - name: observations-volume
+              mountPath: /observations
+              readOnly: true
+            - name: results-volume
+              mountPath: /results
+              readOnly: false
+      volumes:
+        # Use shared RWX storage when another pod copies subs into the input;
+        # this watcher mounts it read-only. A ROX PVC is also suitable when
+        # files arrive outside Kubernetes (e.g. a NAS export mounted on nodes).
+        - name: observations-volume
+          persistentVolumeClaim:
+            claimName: photonloom-observations-pvc
+            readOnly: true
+        # Writable by UID/GID 10001. RWX if other pods need the results;
+        # single-writer RWO is sufficient for this one-replica Deployment.
+        - name: results-volume
+          persistentVolumeClaim:
+            claimName: photonloom-results-pvc

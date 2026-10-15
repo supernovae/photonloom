@@ -8,10 +8,10 @@
 [![CI](https://img.shields.io/github/actions/workflow/status/supernovae/photonloom/ci.yml?branch=main&style=flat-square&logo=github&label=CI)](https://github.com/supernovae/photonloom/actions)
 [![Rust](https://img.shields.io/badge/Rust-2024_Edition-f74c00?style=flat-square&logo=rust)](https://github.com/supernovae/photonloom)
 [![GPU Compute](https://img.shields.io/badge/GPU-wgpu_%7C_Vulkan_%7C_Metal_%7C_DX12_%7C_ROCm-38bdf8?style=flat-square)](https://github.com/supernovae/photonloom#hardware-acceleration--gpu-probe)
-[![Privacy](https://img.shields.io/badge/Runtime-100%25_Local_(127.0.0.1)-10b981?style=flat-square)](https://github.com/supernovae/photonloom#local-web-studio-photonloom-serve)
+[![Privacy](https://img.shields.io/badge/Runtime-100%25_Local_(127.0.0.1)-10b981?style=flat-square)](https://github.com/supernovae/photonloom#local-web-studio-photonloom)
 [![License: MIT](https://img.shields.io/badge/License-MIT-a855f7?style=flat-square)](https://github.com/supernovae/photonloom#licensing-notice)
 
-[**Quick Start**](#-quick-start) · [**Web Studio**](#-local-web-studio-photonloom-serve) · [**Magic View**](#-magic-view-adaptive-measured-finishing) · [**Palettes**](#-spectral--artistic-palettes) · [**Architecture**](#-processing-pipeline) · [**Docker & K8s**](#-container--kubernetes-deployment)
+[**Quick Start**](#-quick-start) · [**Web Studio**](#-local-web-studio-photonloom) · [**Magic View**](#-magic-view-adaptive-measured-finishing) · [**Palettes**](#-spectral--artistic-palettes) · [**Architecture**](#-processing-pipeline) · [**Docker & K8s**](#-container--kubernetes-deployment)
 
 ---
 
@@ -25,6 +25,17 @@
 </div>
 
 ---
+
+## 🧭 Pick your flow
+
+| Flow | Start here | Best for |
+| :--- | :--- | :--- |
+| **Studio** | `photonloom` | Opens the browser to the local, loopback-only studio. |
+| **One-shot** | `photonloom inspect DIR` then `photonloom run DIR` | Preview the observation plan, then process one folder. |
+| **Unattended** | `photonloom watch DIR` / `photonloom serve --watch DIR` / [Kubernetes](#-container--kubernetes-deployment) | Reprocess as new subs arrive, headlessly or with a live studio. |
+
+---
+
 
 ## ✨ Why Photonloom?
 
@@ -41,9 +52,9 @@ Astrophotography pipelines often force a choice between complex manual multi-ste
 
 ---
 
-## 🖥️ Local Web Studio (`photonloom serve`)
+## 🖥️ Local Web Studio (`photonloom`)
 
-Photonloom ships with a zero-dependency local web studio bound strictly to loopback (`127.0.0.1` / `::1`)—no cloud accounts, telemetry, or external CDNs.
+Run `photonloom` to open the browser, or `photonloom serve` to start without opening it. The zero-dependency studio binds strictly to loopback (`127.0.0.1` / `::1`)—no cloud accounts, telemetry, or external CDNs. Its live **Activity** console shows processing stages, detail messages, and progress while runs and Magic View work, so long jobs are never silent.
 
 ### 1. Target Gallery & Display Histogram
 Inspect rendered narrowband and broadband variants, compare the real-time sRGB display histogram, read curated target astronomy context, and download 16-bit TIFFs, sRGB PNGs, or 32-bit float FITS masters.
@@ -90,35 +101,60 @@ flowchart LR
 You can exercise Photonloom right after cloning using either the bundled **16-bit linear-light RGB TIFF** (`docs/assets/example-ctb1-hoo-rgb16.tiff`) or the deterministic **synthetic multi-filter observation generator** (`make_fixture`):
 
 ```bash
+# Open the local studio immediately (no dataset required)
+cargo run --release --
+
 # Option A: Run Magic View directly on the bundled 16-bit linear-light CTB 1 TIFF
 cargo run --release -- magic view docs/assets/example-ctb1-hoo-rgb16.tiff \
-  --output /tmp/photonloom-ctb1-magic \
   --transfer linear \
   --variant enhanced --strength 0.5
 
-# Option B: Generate synthetic multi-filter observations (Ha, OIII, SII, RGB FITS + DNG) and run the full pipeline
+# Option B: Generate synthetic multi-filter observations (Ha, OIII, SII, RGB FITS + DNG)
 cargo run --release --example make_fixture -- /tmp/photonloom-fixture
+# Preview the frame counts, calibration coverage, feasible palettes, and warnings without processing pixels
+cargo run --release -- inspect /tmp/photonloom-fixture
 cargo run --release -- run /tmp/photonloom-fixture \
   --output /tmp/photonloom-gallery \
   --accelerator auto --magic-view
 
-# Launch the local web studio on http://127.0.0.1:8787
-cargo run --release -- serve --sample-gallery /tmp/photonloom-gallery
+# Open the completed gallery in the local studio
+cargo run --release -- serve --gallery /tmp/photonloom-gallery --open
 ```
 
 ### 2. Process Your Own Observations
 
-Point `photonloom run` at any folder containing your night's light frames and optional calibration frames:
+Point `photonloom inspect` at your night's folder for a quick, metadata-only plan, then `photonloom run` for full processing. The folder may contain light frames and optional calibration frames:
 
 ```bash
+photonloom inspect /path/to/observations
+# Machine-readable plan:
+photonloom inspect /path/to/observations --json
+
 # Full calibration, star registration, GPU/CPU integration, and gallery rendering
-cargo run --release -- run /path/to/observations \
+photonloom run /path/to/observations \
   --output /path/to/gallery \
   --accelerator auto
 
 # Open the completed gallery in the local web app without reprocessing
-cargo run --release -- serve --sample-gallery /path/to/gallery
+photonloom serve --gallery /path/to/gallery --open
 ```
+
+### 3. Let a Folder Run Overnight
+
+Copy each night's subs into a watched folder; Photonloom refreshes the science masters, gallery, and **Magic View** interpretations by morning. `watch` polls supported frame files (default every 30 seconds) and waits for the folder to be quiet for `--settle` seconds (default 120) before starting, so files being copied are not processed prematurely. On startup, files whose modification time is already older than the settle window count as quiet, so a cron `--once` pass over last night's frames starts immediately. Each distinct folder snapshot runs **once**; failed snapshots are not retried until files change again. Magic View is on by default (`--no-magic` turns it off). When `serve --watch` restarts, the existing gallery in the output directory is shown immediately.
+
+```bash
+# Headless watcher; keep the latest three runs by default
+photonloom watch /path/to/observations --output /path/to/gallery
+
+# Live studio and watcher together, or a single settled headless pass for cron
+photonloom serve --watch /path/to/observations --output /path/to/gallery --open
+photonloom watch /path/to/observations --output /path/to/gallery --once --settle 300
+```
+
+Use `--interval 30` to tune polling, `--settle 300` for a five-minute quiet period, and `--keep-runs 5` to retain five run directories instead of the default three. Older runs are pruned without removing the run referenced by the current gallery manifest. Watch state and the last result live in `<OUTPUT>/.photonloom-watch.json`; keep this file with the output to preserve once-per-snapshot behavior across restarts.
+
+### 4. Re-finish Without Restacking
 
 Re-finish an existing gallery from its stored 32-bit float FITS integrations without recalibrating or restacking:
 
@@ -156,7 +192,7 @@ cargo run --release -- edit /path/to/gallery "make the SHO image starless"
 
 ## 🪄 Magic View (Adaptive Measured Finishing)
 
-**Magic View** is an opt-in, non-generative finishing engine that measures sky background MAD/high-frequency noise, stellar PSF profiles (FWHM & eccentricity), multiscale structure contrast, and chroma separation to propose three independent candidates: **Natural** ($0.30\times$), **Enhanced** ($0.65\times$), and **Dramatic** ($1.00\times$).
+**Magic View** is an opt-in, non-generative finishing engine for one-shot runs (and is on by default in watch). It measures sky background MAD/high-frequency noise, stellar PSF profiles (FWHM & eccentricity), multiscale structure contrast, and chroma separation to propose three independent candidates: **Natural** ($0.30\times$), **Enhanced** ($0.65\times$), and **Dramatic** ($1.00\times$). `photonloom magic view INPUT` no longer requires `--output`: for a gallery directory, results go in that directory; for a file, they go in `<file-parent>/<file-stem>-magic`. Pass `--output DIR` to override.
 
 ```bash
 # Analyze a gallery target and render three previews + a full-resolution Enhanced output
@@ -269,19 +305,55 @@ Core processing requires **no** Python, PyTorch, or LLM server. Two opt-in local
 Photonloom runs headlessly in Docker and Kubernetes using the same `photonloom` binary without requiring a GPU node:
 
 ```bash
-# Run prebuilt container directly from GitHub Container Registry (GHCR)
+# One-shot: the image's default command processes /observations into /results
 docker run --rm \
   -v /path/to/observations:/observations:ro \
   -v /path/to/results:/results:rw \
   ghcr.io/supernovae/photonloom:latest
 
+# Headless watcher: mount an incoming folder that receives new subs
+docker run --rm \
+  -v /path/to/observations:/observations:ro \
+  -v /path/to/results:/results:rw \
+  ghcr.io/supernovae/photonloom:latest \
+  watch /observations --output /results
+
+# Studio in Docker: host networking is required because the server binds loopback only
+docker run --rm --network host \
+  -v /path/to/observations:/observations:ro \
+  -v /path/to/results:/results:rw \
+  ghcr.io/supernovae/photonloom:latest \
+  serve --watch /observations --output /results --bind 127.0.0.1:8787
+
 # Or build locally from Dockerfile
 docker build -t photonloom:latest .
-# Kubernetes Job (deploy/photonloom-job.yaml)
+```
+
+| Kubernetes workload | Manifest | Use when |
+| :--- | :--- | :--- |
+| **Job** | `deploy/photonloom-job.yaml` | One-off processing of a complete observation folder. |
+| **CronJob** | `deploy/photonloom-cronjob.yaml` | Nightly headless batch; one settled snapshot per scheduled run. |
+| **Deployment** | `deploy/photonloom-watch.yaml` | Continuous watch plus live studio; one replica, replacing rather than overlapping pods. |
+
+```bash
+# Provision PVCs first; for the optional single-node MicroK8s hostPath example,
+# prepare the node paths as noted in the manifest and apply it:
+kubectl apply -f deploy/photonloom-microk8s-hostpath.yaml
+
+# Choose ONE workload:
+# One-off:
 kubectl apply -f deploy/photonloom-job.yaml
 kubectl wait --for=condition=complete --timeout=300s job/photonloom-run
 kubectl logs job/photonloom-run
+
+# OR nightly unattended batch:
+kubectl apply -f deploy/photonloom-cronjob.yaml
+# OR continuous watching with a live studio:
+kubectl apply -f deploy/photonloom-watch.yaml
+kubectl port-forward deploy/photonloom-watch 8787:8787
 ```
+
+Use the manifests as **alternatives** for the same result directory rather than running Job, CronJob, and Deployment simultaneously. The studio deliberately listens on pod loopback only; `kubectl port-forward` reaches that loopback listener without exposing a cluster Service. The observation claim must be readable by Photonloom while your capture/copy process can add files (shared RWX storage with a read-only mount in the watcher); result storage must be writable by UID 10001. For a single-node MicroK8s observatory with host paths such as `/srv/astro/incoming`, see `deploy/photonloom-microk8s-hostpath.yaml`.
 
 ---
 

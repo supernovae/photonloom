@@ -1181,6 +1181,36 @@ fn canonical_palette(palette: &str) -> Result<String> {
     }
 }
 
+/// Metadata-only palette feasibility; actual rendering still validates the image data.
+pub fn feasible_palettes(channels: &[Channel]) -> Vec<String> {
+    let has = |ch| channels.contains(&ch);
+    let sho = has(Channel::Sii) && has(Channel::Ha) && has(Channel::Oiii);
+    let rgb = has(Channel::RgbCfa) || (has(Channel::R) && has(Channel::G) && has(Channel::B));
+    let only_mono = channels.len() == 1 && !has(Channel::RgbCfa);
+    let mut palettes = Vec::new();
+    if rgb {
+        palettes.push("natural".into());
+    }
+    if !only_mono && has(Channel::Ha) && has(Channel::Oiii) {
+        palettes.push("hoo".into());
+    }
+    if !only_mono && sho {
+        palettes.extend(["sho", "osh", "hubble"].map(str::to_string));
+    }
+    if !only_mono && (sho || rgb) {
+        palettes.push("jwst-inspired".into());
+    }
+    if !only_mono && !sho && rgb {
+        palettes.push("hubble-inspired".into());
+    }
+    for ch in channels {
+        if *ch != Channel::RgbCfa {
+            palettes.push(if only_mono { "monochrome".into() } else { format!("monochrome-{}", ch.as_str()) });
+        }
+    }
+    palettes
+}
+
 /// Renders all feasible gallery variants for a target from present channels.
 #[allow(clippy::too_many_arguments)]
 pub fn render_target_gallery(
@@ -1230,28 +1260,7 @@ pub fn render_target_gallery(
     let has_sho = norm_channels.contains_key(&Channel::Sii)
         && norm_channels.contains_key(&Channel::Ha)
         && norm_channels.contains_key(&Channel::Oiii);
-    let has_only_mono = raw_channels.len() == 1 && !raw_channels.contains_key(&Channel::RgbCfa);
-
-    let mut candidate_palettes = vec![
-        "natural".to_string(),
-        "hoo".to_string(),
-        "sho".to_string(),
-        "osh".to_string(),
-        "hubble".to_string(),
-        "jwst-inspired".to_string(),
-    ];
-    if !has_sho {
-        candidate_palettes.push("hubble-inspired".to_string());
-    }
-    for &ch in raw_channels.keys() {
-        if ch != Channel::RgbCfa {
-            candidate_palettes.push(if has_only_mono {
-                "monochrome".to_string()
-            } else {
-                format!("monochrome-{}", ch.as_str())
-            });
-        }
-    }
+    let mut candidate_palettes = feasible_palettes(&raw_channels.keys().copied().collect::<Vec<_>>());
     if mix_spec.is_some() {
         candidate_palettes.push("custom".to_string());
     }
@@ -1260,15 +1269,6 @@ pub fn render_target_gallery(
     let mut omitted_variants = Vec::new();
 
     for pal_id in candidate_palettes {
-        // A lone mono filter must never be interpreted as a color palette.
-        if has_only_mono && pal_id != "monochrome" && pal_id != "custom" {
-            omitted_variants.push(OmittedVariantRecord {
-                palette: pal_id,
-                reason: "Only one monochrome filter is present; omitting color synthesis."
-                    .to_string(),
-            });
-            continue;
-        }
 
         // A failed cross-filter registration cannot be hidden behind an artistic preset
         // or custom mix. A native CFA image needs no cross-filter registration.
@@ -1307,6 +1307,7 @@ pub fn render_target_gallery(
                 let tiff_path = run_dir.join(&tiff_name);
                 let png_path = run_dir.join(&png_name);
                 write_variant_images(&stretched, &tiff_path, &png_path)?;
+                options.report_detail(&format!("Rendered {} · {}: {} and {}", target_label, title, tiff_name, png_name));
 
                 let provenance = format!(
                     "Channels: {} | Total exposure: {:.1}s | Calibrated & integrated linear float",
@@ -1389,6 +1390,7 @@ pub fn render_target_gallery(
             crop: base_var.crop,
             magic: None,
         });
+        options.report_detail(&format!("Rendered {} · restored: {} and {}", target_label, restored_tiff_name, restored_png_name));
     }
 
     if variants.is_empty() {

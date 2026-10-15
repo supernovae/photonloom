@@ -10,12 +10,14 @@ pub mod gpu;
 mod hip;
 pub mod magic;
 pub mod integrate;
+pub mod plan;
 pub mod models;
 pub mod raw;
 pub mod register;
 pub mod scan;
 pub mod stars;
 pub mod web;
+pub mod watch;
 
 use anyhow::{Context, Result, bail};
 pub use config::{
@@ -49,8 +51,8 @@ pub fn atomic_write_file(dest: &Path, contents: &[u8]) -> Result<()> {
 }
 
 /// Checks if an existing output directory is safe to use for `canonical_input`.
-/// Allows if `output` does not exist, if `output` is an empty directory (or only has `lost+found`),
-/// or if `output/manifest.json` exists and names the same `canonical_input`.
+/// Allows a missing directory, an empty directory (including watch state or `lost+found`),
+/// or an existing manifest belonging to the same input.
 pub fn check_existing_output_allowed(output: &Path, canonical_input: &Path) -> Result<bool> {
     if !output.exists() {
         return Ok(false);
@@ -94,7 +96,7 @@ pub fn check_existing_output_allowed(output: &Path, canonical_input: &Path) -> R
     {
         let entry = entry?;
         let name = entry.file_name();
-        if name != "lost+found" {
+        if name != "lost+found" && name != ".photonloom-watch.json" {
             non_empty = true;
             break;
         }
@@ -110,6 +112,7 @@ pub fn check_existing_output_allowed(output: &Path, canonical_input: &Path) -> R
 
 /// Main processing entry point for CLI and Web runs.
 pub fn process(input: &Path, output: &Path, options: &ProcessOptions) -> Result<GalleryManifest> {
+    let started = std::time::Instant::now();
     options.report_progress("Validating paths and options", 0.02);
     options.finish.resolve()?;
     let (canon_in, canon_out) = config::validate_input_output_paths(input, output)?;
@@ -139,6 +142,13 @@ pub fn process(input: &Path, output: &Path, options: &ProcessOptions) -> Result<
         )
     })?;
 
+    // With Magic View enabled the stacking pipeline owns 0–80% of the bar and Magic the rest.
+    const STACK_SHARE: f32 = 0.80;
+    let stack_options = if options.magic_view {
+        ProcessOptions { progress: scaled_progress(options.progress.as_ref(), 0.0, STACK_SHARE), ..options.clone() }
+    } else {
+        options.clone()
+    };
     let result = process_inner(
         &canon_in,
         &canon_out,
@@ -147,7 +157,7 @@ pub fn process(input: &Path, output: &Path, options: &ProcessOptions) -> Result<
         &run_dir,
         &staging_dir,
         now_ms,
-        options,
+        &stack_options,
         mix_spec.as_ref(),
     );
 
@@ -162,20 +172,32 @@ pub fn process(input: &Path, output: &Path, options: &ProcessOptions) -> Result<
         Ok(mut manifest) => {
             staging_cleanup?;
             if options.magic_view {
-                for target_id in manifest.targets.iter().map(|t| t.target_id.clone()).collect::<Vec<_>>() {
+                options.report_progress("Magic View · measuring and enhancing targets", STACK_SHARE);
+                let target_ids = manifest.targets.iter().map(|t| t.target_id.clone()).collect::<Vec<_>>();
+                let target_span = (0.99 - STACK_SHARE) / target_ids.len().max(1) as f32;
+                for (index, target_id) in target_ids.into_iter().enumerate() {
                     let source = magic::MagicSource::Gallery {
                         gallery: canon_out.clone(), target_id: target_id.clone(), palette: String::new(),
                     };
+                    options.report_detail(&format!("Magic View · target {target_id}"));
+                    // Analyze, baseline previews, 50% previews, full render: each phase reports 0..1 locally.
+                    let start = STACK_SHARE + index as f32 * target_span;
+                    let phase = |lo: f32, hi: f32| config::ProgressSink(
+                        scaled_progress(options.progress.as_ref(), start + lo * target_span, start + hi * target_span));
                     let result = (|| -> Result<()> {
                         let resolved_finish = options.finish.resolve().unwrap_or_else(|_| options.finish.preset.resolved_defaults());
                         let starless = resolved_finish.star_mode == crate::finish_style::StarMode::Starless;
                         let star_blend = (resolved_finish.star_mode == crate::finish_style::StarMode::Reduced)
                             .then_some(resolved_finish.star_blend);
                         let mut session = magic::analyze(&source, &magic::MagicOptions {
-                            crop: options.trim_edges, starless, star_blend, ..Default::default()
+                            crop: options.trim_edges, starless, star_blend,
+                            progress: phase(0.0, 0.10), ..Default::default()
                         }, &canon_out)?;
+                        session.progress = phase(0.10, 0.30);
                         magic::preview(&mut session, 0.0)?;
+                        session.progress = phase(0.30, 0.60);
                         magic::preview(&mut session, 0.5)?;
+                        session.progress = phase(0.60, 1.0);
                         let artifact = magic::render(&mut session, magic::MagicVariant::Enhanced, 0.5)?;
                         if let Some(target) = manifest.targets.iter_mut().find(|target| target.target_id == target_id) {
                             target.selected_variant = artifact.id;
@@ -196,6 +218,7 @@ pub fn process(input: &Path, output: &Path, options: &ProcessOptions) -> Result<
                     }
                 }
                 published.warnings = manifest.warnings;
+                published.elapsed_ms = started.elapsed().as_millis() as u64;
                 let bytes = serde_json::to_vec_pretty(&published)?;
                 atomic_write_file(&run_dir.join("manifest.json"), &bytes)?;
                 atomic_write_file(&run_dir.join("index.html"), finish::generate_static_gallery_html(&published, true)?.as_bytes())?;
@@ -204,6 +227,11 @@ pub fn process(input: &Path, output: &Path, options: &ProcessOptions) -> Result<
                 manifest = published;
             }
             options.report_progress("Succeeded", 1.0);
+            manifest.elapsed_ms = started.elapsed().as_millis() as u64;
+            options.report_detail(&format!("Completed in {:.1}s (including Magic View)", manifest.elapsed_ms as f64 / 1000.0));
+            let bytes = serde_json::to_vec_pretty(&manifest)?;
+            atomic_write_file(&run_dir.join("manifest.json"), &bytes)?;
+            atomic_write_file(&canon_out.join("manifest.json"), &bytes)?;
             Ok(manifest)
         }
         Err(err) => {
@@ -238,12 +266,35 @@ fn process_inner(
 ) -> Result<GalleryManifest> {
     options.report_progress("Scanning and classifying frames", 0.05);
     let scan_report = scan::scan_detailed(canon_in)?;
+    if options.progress.is_some() {
+        let mut counts = std::collections::BTreeMap::<String, usize>::new();
+        for frame in &scan_report.frames {
+            let key = match frame.channel {
+                Some(ch) => format!("{} {ch}", frame.role),
+                None => frame.role.to_string(),
+            };
+            *counts.entry(key).or_default() += 1;
+        }
+        options.report_detail(&format!("Scan: {} · {} unreadable",
+            counts.iter().map(|(role, count)| format!("{role} {count}")).collect::<Vec<_>>().join(" · "),
+            scan_report.rejected_frames.len()));
+        for rejected in &scan_report.rejected_frames {
+            options.report_detail(&format!("Unreadable {}: {}", rejected.path, rejected.reason));
+        }
+    }
 
     options.report_progress(
         "Partitioning targets and matching calibration masters",
         0.05,
     );
     let groups = scan::partition_targets(&scan_report, options)?;
+    for group in &groups {
+        let bands = group.lights_by_channel.iter().map(|(ch, frames)| format!(
+            "{ch}: {} frames × {:.1}s", frames.len(), frames.first().and_then(|f| f.exposure).unwrap_or(0.0)))
+            .collect::<Vec<_>>().join(", ");
+        let hours: f64 = group.lights_by_channel.values().flatten().map(|f| f.exposure.unwrap_or(0.0) as f64).sum::<f64>() / 3600.0;
+        options.report_detail(&format!("Target {} · {bands} · {:.2} integration hours", group.target_label, hours));
+    }
 
     let mut warnings = scan_report.warnings.clone();
     let mut rejected_frames = scan_report.rejected_frames.clone();
@@ -273,10 +324,7 @@ fn process_inner(
             let channel_start = base_prog + channel_idx as f32 * channel_span;
             let calibration_end = channel_start + 0.30 * channel_span;
             options.report_progress(
-                &format!(
-                    "Calibrating target '{}' channel {}",
-                    group.target_label, channel
-                ),
+                &format!("Calibrating {} · {}", group.target_label, channel),
                 channel_start,
             );
             let channel_staging = staging_dir.join(&group.target_id).join(channel.as_str());
@@ -308,10 +356,7 @@ fn process_inner(
                 }
             }
             options.report_progress(
-                &format!(
-                    "Registering and integrating target '{}' channel {}",
-                    group.target_label, channel
-                ),
+                &format!("Registering {} · {}", group.target_label, channel),
                 calibration_end,
             );
             let channel_output = integrate::integrate_target_channels(
@@ -373,6 +418,7 @@ fn process_inner(
         canonical_input: canon_in.to_string_lossy().to_string(),
         canonical_output: canon_out.to_string_lossy().to_string(),
         created_at_unix_ms: now_ms,
+        elapsed_ms: 0,
         accelerator_requested: options.accelerator.to_string(),
         accelerator_used: actual_accelerator,
         targets: target_galleries,
@@ -395,4 +441,15 @@ fn process_inner(
     atomic_write_file(&canon_out.join("index.html"), root_html.as_bytes())?;
 
     Ok(manifest)
+}
+
+/// Maps a sub-operation's 0..1 stage fractions into `[lo, hi]` of the enclosing run's bar.
+fn scaled_progress(callback: Option<&config::ProgressCallback>, lo: f32, hi: f32) -> Option<config::ProgressCallback> {
+    let callback = callback?.clone();
+    Some(std::sync::Arc::new(move |event: config::ProgressEvent<'_>| {
+        callback(config::ProgressEvent {
+            message: event.message,
+            fraction: event.fraction.map(|fraction| lo + (hi - lo) * fraction.clamp(0.0, 1.0)),
+        });
+    }))
 }

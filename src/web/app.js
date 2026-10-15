@@ -14,6 +14,41 @@
   let lastRenderedStrength = null;
   let magicBusy = false;
   let activePage = "run";
+  let inspectedInput = null;
+  let latestRun = null;
+  let latestMagic = null;
+  let lastWatchRun = null;
+
+  const byId = (id) => document.getElementById(id);
+  const elapsed = (ms) => `${String(Math.floor(ms / 60000)).padStart(2, "0")}:${String(Math.floor(ms / 1000) % 60).padStart(2, "0")}`;
+  function logText(job) {
+    return (job.log || []).map((entry) => `${elapsed(entry.elapsed_ms)}  ${entry.progress == null ? "     " : `[${Math.round(entry.progress * 100)}%]`.padEnd(5)} ${entry.message}`).join("\n");
+  }
+  function activity(job, kind) {
+    const consoleEl = byId(kind === "run" ? "run-activity" : "magic-activity");
+    // Follow the tail unless the user scrolled up; always jump to the tail when a different job appears.
+    const newJob = consoleEl.dataset.jobId !== job.id;
+    const nearBottom = newJob || consoleEl.scrollHeight - consoleEl.scrollTop - consoleEl.clientHeight < 30;
+    consoleEl.dataset.jobId = job.id;
+    const text = logText(job) || (job.status === "queued" ? "Queued — waiting for a worker…" : job.stage || "Starting…");
+    if (consoleEl.textContent !== text) consoleEl.textContent = text;
+    if (nearBottom) requestAnimationFrame(() => { consoleEl.scrollTop = consoleEl.scrollHeight; });
+    const duration = job.started_unix_ms
+      ? Math.max(0, (job.finished_unix_ms || Date.now()) - job.started_unix_ms) : 0;
+    const rate = job.progress > 0 && job.progress < 1 && job.status === "running"
+      ? ` · about ${elapsed(duration * (1 - job.progress) / job.progress)} remaining` : "";
+    byId(kind === "run" ? "job-clock" : "magic-clock").textContent = `${elapsed(duration)} elapsed${rate}`;
+    if (kind === "magic") {
+      byId("magic-activity-wrap").classList.remove("hidden");
+      byId("magic-progress-bar").style.width = `${Math.round((job.progress || 0) * 100)}%`;
+    }
+  }
+  byId("copy-run-log").addEventListener("click", () => navigator.clipboard.writeText(byId("run-activity").textContent));
+  byId("copy-magic-log").addEventListener("click", () => navigator.clipboard.writeText(byId("magic-activity").textContent));
+  setInterval(() => {
+    if (latestRun) activity(latestRun, "run");
+    if (latestMagic) activity(latestMagic, "magic");
+  }, 1000);
 
   const pages = {
     run: document.getElementById("page-run"),
@@ -44,6 +79,69 @@
   const stageText = document.getElementById("job-stage-text");
   const errorBox = document.getElementById("job-error-box");
   const warningsBox = document.getElementById("job-warnings-box");
+  const planCard = byId("plan-card");
+  const checkFolder = byId("check-folder");
+
+  function shellQuote(value) { return `'${String(value).replaceAll("'", "'\\''")}'`; }
+  function updateCli() {
+    const parts = ["photonloom run", shellQuote(inputPathEl.value.trim() || "/path/to/observations")];
+    if (outputPathEl.value.trim()) parts.push("--output", shellQuote(outputPathEl.value.trim()));
+    parts.push("--accelerator", byId("run-accelerator").value);
+    if (initialPaletteEl.value) parts.push("--palette", initialPaletteEl.value);
+    if (byId("run-mix").value.trim()) parts.push("--mix", shellQuote(byId("run-mix").value.trim()));
+    if (byId("run-restore").checked) parts.push("--restore");
+    if (byId("run-keep-edges").checked) parts.push("--keep-edges");
+    if (byId("run-starless").checked) parts.push("--starless");
+    if (byId("run-magic-view").checked) parts.push("--magic-view");
+    byId("cli-equivalent").textContent = parts.join(" ");
+  }
+  runForm.addEventListener("input", (event) => {
+    if (event.target === inputPathEl) {
+      inspectedInput = null;
+      startRunBtn.disabled = true;
+      startRunBtn.textContent = "Check folder to continue";
+      planCard.classList.add("hidden");
+      for (const option of initialPaletteEl.options) option.disabled = false;
+    }
+    updateCli();
+  });
+  runForm.addEventListener("change", updateCli);
+  byId("copy-cli").addEventListener("click", () => navigator.clipboard.writeText(byId("cli-equivalent").textContent));
+  updateCli();
+  checkFolder.addEventListener("click", async () => {
+    const input = inputPathEl.value.trim();
+    if (!input) { inputPathEl.reportValidity(); return; }
+    checkFolder.disabled = true;
+    planCard.classList.remove("hidden");
+    planCard.textContent = "Checking folder…";
+    try {
+      const response = await fetch("/api/inspect", {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ input }),
+      });
+      const plan = await response.json();
+      if (!response.ok) throw new Error(plan.error || "Could not inspect folder");
+      if (inputPathEl.value.trim() !== input) return;
+      inspectedInput = input;
+      startRunBtn.disabled = false;
+      startRunBtn.textContent = "Run observations";
+      const feasible = new Set(plan.feasible_palettes || []);
+      for (const option of initialPaletteEl.options) {
+        option.disabled = Boolean(option.value && !feasible.has(option.value));
+      }
+      if (initialPaletteEl.selectedOptions[0]?.disabled) initialPaletteEl.value = "";
+      planCard.innerHTML = `<strong>${plan.totals.lights} light frames · ${plan.targets.length} target${plan.targets.length === 1 ? "" : "s"}</strong>
+        <p>Output: ${escapeHtml(outputPathEl.value.trim() || plan.default_output)} · Feasible palettes: ${escapeHtml(plan.feasible_palettes.join(", ") || "none yet")}</p>
+        ${plan.targets.map((target) => `<div class="plan-target"><strong>${escapeHtml(target.label)}</strong> · ${target.width}×${target.height}
+          ${target.channels.map((channel) => `<div>${escapeHtml(channel.channel)} · ${channel.frames} frames · ${Number(channel.total_exposure_s).toFixed(1)}s integration · calibration ${channel.calibration.missing.length ? `missing ${escapeHtml(channel.calibration.missing.join(", "))}` : "✓"}</div>`).join("")}</div>`).join("")}
+        ${plan.warnings.length ? `<p class="warnings-box">${plan.warnings.map(escapeHtml).join("<br>")}</p>` : ""}`;
+      updateCli();
+    } catch (error) {
+      inspectedInput = null;
+      startRunBtn.disabled = true;
+      startRunBtn.textContent = "Check folder to continue";
+      planCard.textContent = error.message;
+    } finally { checkFolder.disabled = false; }
+  });
 
   const workspace = document.getElementById("gallery-workspace");
   const galleryEmptyState = document.getElementById("gallery-empty-state");
@@ -273,7 +371,9 @@
   }
 
   function updateStatusUI(job) {
+    latestRun = job;
     const isRunning = job.status === "queued" || job.status === "running";
+    activity(job, "run");
     const isSucceeded = job.status === "succeeded";
     const hasError = Boolean(job.error);
     const warnings = job.warnings || (job.manifest && job.manifest.warnings) || [];
@@ -286,7 +386,7 @@
     setEditBusy(!isSucceeded);
     const pct = Math.round((job.progress || 0) * 100);
     progressBar.parentElement.classList.toggle("hidden", !isRunning);
-    stageText.classList.toggle("hidden", !isRunning && !hasError);
+    stageText.classList.toggle("hidden", false);
     progressBar.style.width = `${pct}%`;
     stageText.textContent = `${job.stage || job.status} (${pct}%)`;
 
@@ -505,27 +605,109 @@
     }
   }
 
+  async function openRun(job) {
+    currentRunId = job.id;
+    updateStatusUI(job);
+    if (job.status === "succeeded") {
+      const response = await fetch(`/api/runs/${encodeURIComponent(job.id)}/gallery`);
+      if (response.ok) {
+        activeTargetId = null;
+        activeVariantId = null;
+        renderGallery(await response.json());
+        navigateToPage("gallery", true);
+      }
+    } else if (job.status === "queued" || job.status === "running") {
+      clearInterval(pollTimer);
+      pollTimer = setInterval(() => pollJob(job.id), 500);
+      navigateToPage("run", true);
+    } else {
+      navigateToPage("run", true);
+    }
+  }
+
+  async function refreshRuns() {
+    try {
+      const response = await fetch("/api/runs");
+      if (!response.ok) return;
+      const runs = await response.json();
+      const list = byId("recent-runs");
+      list.replaceChildren();
+      for (const job of runs) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "recent-item";
+        const duration = job.started_unix_ms
+          ? elapsed(Math.max(0, (job.finished_unix_ms || Date.now()) - job.started_unix_ms)) : "—";
+        button.textContent = `${job.input.split("/").filter(Boolean).at(-1) || job.input} · ${job.status} · ${job.source || "manual"} · ${duration}`;
+        button.addEventListener("click", () => openRun(job));
+        list.append(button);
+      }
+      if (!runs.length) list.textContent = "Your integrations will appear here.";
+    } catch (error) { console.error("Recent runs unavailable:", error); }
+  }
+
+  async function refreshWatch() {
+    try {
+      const response = await fetch("/api/watch");
+      if (!response.ok) return;
+      const watch = await response.json();
+      byId("watch-card").classList.toggle("hidden", !watch);
+      if (!watch) return;
+      byId("watch-paths").textContent = `${watch.input} → ${watch.output} · ${watch.frame_files} frame files`;
+      const quiet = Math.max(watch.quiet_for_s, watch.last_change_unix_ms
+        ? Math.floor((Date.now() - watch.last_change_unix_ms) / 1000) : 0);
+      const remaining = Math.max(0, watch.settle_s - quiet);
+      const waitLabel = remaining >= 60 ? `${Math.ceil(remaining / 60)} min` : `${remaining}s`;
+      const files = `${watch.changed_files} new or changed frame${watch.changed_files === 1 ? "" : "s"}`;
+      byId("watch-state").textContent = watch.state === "settling"
+        ? (remaining > 0
+          ? `${files} detected — integrating once the folder has been quiet for ${waitLabel} more`
+          : `${files} detected — folder is quiet, starting integration…`)
+        : ({ idle: "Up to date — waiting for new observations", queued: "Integration queued", processing: "Integrating new observations (see Activity below)", error: "Watch scan needs attention" }[watch.state] || watch.state);
+      byId("watch-last").textContent = watch.last_run
+        ? `Last run: ${watch.last_run.ok ? "completed" : `failed — ${watch.last_run.error || "unknown error"}`} · ${watch.last_run.frame_files} frames in ${elapsed(watch.last_run.elapsed_ms)} · finished ${new Date(watch.last_run.finished_unix_ms).toLocaleString()}`
+        : "No integrations yet";
+      byId("watch-next").textContent = watch.next_check_unix_ms
+        ? `Next check in ${Math.max(0, Math.ceil((watch.next_check_unix_ms - Date.now()) / 1000))}s` : "";
+      const record = watch.last_run;
+      const key = record && `${record.finished_unix_ms}:${record.run_id}`;
+      if (record?.ok && lastWatchRun && key !== lastWatchRun) {
+        byId("watch-banner").classList.remove("hidden");
+        if (activePage === "gallery" && !document.activeElement?.matches("input, textarea, select, [contenteditable]")) {
+          const runs = await (await fetch("/api/runs")).json();
+          const latest = runs.find((run) => run.manifest?.run_id === record.run_id);
+          if (latest) await openRun(latest);
+        }
+      }
+      lastWatchRun = key;
+      refreshRuns();
+    } catch (error) { console.error("Watch status unavailable:", error); }
+  }
+  setInterval(refreshWatch, 1000);
+  refreshWatch();
   async function pollJob(runId) {
     try {
       const resp = await fetch(`/api/runs/${encodeURIComponent(runId)}`);
       if (!resp.ok) return;
       const job = await resp.json();
+      if (runId !== currentRunId) return;
       updateStatusUI(job);
+      refreshRuns();
       if (job.status === "succeeded") {
         clearInterval(pollTimer);
         pollTimer = null;
-        startRunBtn.disabled = false;
+        startRunBtn.disabled = inspectedInput !== inputPathEl.value.trim();
         const galResp = await fetch(`/api/runs/${encodeURIComponent(runId)}/gallery`);
         if (galResp.ok) {
           const manifest = await galResp.json();
           activeVariantId = manifest.targets[0]?.selected_variant || null;
           renderGallery(manifest);
-          navigateToPage("gallery", true);
+          if (job.source === "manual") navigateToPage("gallery", true);
         }
       } else if (job.status === "failed") {
         clearInterval(pollTimer);
         pollTimer = null;
-        startRunBtn.disabled = false;
+        startRunBtn.disabled = inspectedInput !== inputPathEl.value.trim();
       }
     } catch (err) {
       console.error("Poll error:", err);
@@ -544,7 +726,7 @@
     const input = inputPathEl.value.trim();
     const output = outputPathEl.value.trim() || null;
     const palette = initialPaletteEl.value.trim() || null;
-    if (!input) return;
+    if (!input || inspectedInput !== input) return;
 
     startRunBtn.disabled = true;
     showFeedback("");
@@ -556,11 +738,14 @@
           input,
           output,
           palette,
+          accelerator: byId("run-accelerator").value,
+          mix: byId("run-mix").value.trim() || null,
+          restore: byId("run-restore").checked,
           magic_view: document.getElementById("run-magic-view").checked,
           finish: document.getElementById("run-starless")?.checked
             ? { ...readFinishValues(), star_mode: "starless", star_blend: 0.0 }
             : readFinishValues(),
-          trim_edges: trimEdgesEl.checked,
+          trim_edges: !byId("run-keep-edges").checked,
         }),
       });
       const data = await resp.json();
@@ -568,7 +753,7 @@
         statusPanel.classList.remove("hidden");
         errorBox.textContent = data.error || "Run request failed";
         errorBox.classList.remove("hidden");
-        startRunBtn.disabled = false;
+        startRunBtn.disabled = inspectedInput !== inputPathEl.value.trim();
         return;
       }
       currentRunId = data.id;
@@ -578,7 +763,7 @@
       pollTimer = setInterval(() => pollJob(currentRunId), 350);
       pollJob(currentRunId);
     } catch (err) {
-      startRunBtn.disabled = false;
+      startRunBtn.disabled = inspectedInput !== inputPathEl.value.trim();
       showFeedback(`Request error: ${err.message}`, true);
     }
   });
@@ -1022,12 +1207,16 @@
 
   async function awaitMagic(job) {
     magicStatus.textContent = job.stage;
+    latestMagic = job;
+    activity(job, "magic");
     while (job.status === "queued" || job.status === "running") {
       await new Promise((resolve) => setTimeout(resolve, 500));
       const response = await fetch(`/api/magic/sessions/${encodeURIComponent(job.id)}`);
       if (!response.ok) throw new Error("Magic job status unavailable");
       job = await response.json();
       magicStatus.textContent = job.stage;
+      latestMagic = job;
+      activity(job, "magic");
     }
     if (job.status !== "succeeded") throw new Error(job.error || "Magic job failed");
     magicJobId = job.id;
@@ -1202,9 +1391,9 @@
     event.preventDefault();
     const path = document.getElementById("file-path").value.trim();
     const output = document.getElementById("file-output").value.trim();
-    if (!path || !output) {
+    if (!path) {
       navigateToPage("magic", true);
-      setMagicFeedback("Image path and output directory are required.", true);
+      setMagicFeedback("Image path is required.", true);
       return;
     }
     standalone = true;
@@ -1253,6 +1442,7 @@
           if (!outputPathEl.value && latest.output) {
             outputPathEl.value = latest.output;
           }
+          updateCli();
           updateStatusUI(latest);
           if (latest.status === "succeeded" && latest.manifest) {
             activeVariantId = latest.manifest.targets[0]?.selected_variant || null;

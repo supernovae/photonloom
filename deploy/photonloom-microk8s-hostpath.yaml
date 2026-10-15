@@ -1,0 +1,63 @@
+# OPTIONAL single-node MicroK8s example. HostPath is node-local, not a shared
+# NAS provisioner: use a real RWX CSI/NFS volume for multi-node deployments.
+# Before applying, on the MicroK8s node:
+#   sudo mkdir -p /srv/astro/incoming /srv/astro/results
+#   sudo chown 10001:10001 /srv/astro/results
+# Ensure incoming is readable by UID 10001. Add new subs from the host/NAS
+# into /srv/astro/incoming; the Photonloom pods mount that path read-only.
+# These PV capacities are binding metadata, not hostPath filesystem quotas.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: photonloom-observations-hostpath
+spec:
+  capacity:
+    storage: 1Ti
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  hostPath:
+    path: /srv/astro/incoming
+    type: Directory
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: photonloom-observations-pvc
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: ""
+  volumeName: photonloom-observations-hostpath
+  resources:
+    requests:
+      storage: 1Ti
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: photonloom-results-hostpath
+spec:
+  capacity:
+    storage: 1Ti
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  hostPath:
+    path: /srv/astro/results
+    type: Directory
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: photonloom-results-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: ""
+  volumeName: photonloom-results-hostpath
+  resources:
+    requests:
+      storage: 1Ti
