@@ -54,7 +54,17 @@ Astrophotography pipelines often force a choice between complex manual multi-ste
 
 ## 🖥️ Local Web Studio (`photonloom`)
 
-Run `photonloom` to open the browser, or `photonloom serve` to start without opening it. The zero-dependency studio binds strictly to loopback (`127.0.0.1` / `::1`)—no cloud accounts, telemetry, or external CDNs. Its live **Activity** console shows processing stages, detail messages, and progress while runs and Magic View work, so long jobs are never silent.
+Run `photonloom` to open the browser, or `photonloom serve` to start without opening it. The zero-dependency studio binds strictly to loopback (`127.0.0.1` / `::1`)—no cloud accounts, telemetry, or external CDNs. Its live **Activity** console shows processing stages, detail messages, elapsed time, and an estimated time remaining for runs and Magic View jobs, so long jobs are never silent.
+
+The **Run & Import** page is a guided flow: **(1)** enter the observations folder and click **Check folder** to see the plan (targets × filters × frames × integration time, calibration ✓/missing, feasible palettes, warnings); **(2)** choose the palette, accelerator, Magic View, starless, and advanced options, with a copyable **CLI equivalent**; **(3)** run. With `serve --watch`, a **folder-watch card** shows the settle countdown, the last result, and the next check, and a banner announces each new integration. A recent-runs list lets you reopen earlier galleries.
+
+| `serve` option | Default | Purpose |
+| :--- | :--- | :--- |
+| `--bind ADDR` | `127.0.0.1:8787` (tries 8787–8797 if busy) | Loopback address; an explicit bind disables the port fallback |
+| `--open` | off (on for bare `photonloom`) | Open the studio in your browser |
+| `--gallery DIR` / `PHOTONLOOM_GALLERY` | none | Show an existing gallery without reprocessing |
+| `--watch DIR` `--output DIR` | off | Watch a folder while serving (accepts the same tuning and processing flags as `watch`) |
+| `--local-llm URL` | none | Optional loopback `llama-server` for free-form edits |
 
 ### 1. Target Gallery & Display Histogram
 Inspect rendered narrowband and broadband variants, compare the real-time sRGB display histogram, read curated target astronomy context, and download 16-bit TIFFs, sRGB PNGs, or 32-bit float FITS masters.
@@ -96,6 +106,14 @@ flowchart LR
 
 ## 🚀 Quick Start
 
+### 0. Install
+
+- **Prebuilt binaries**: download `photonloom-linux-x86_64.tar.gz`, `photonloom-macos-arm64.tar.gz`, or `photonloom-windows-x86_64.zip` from [GitHub Releases](https://github.com/supernovae/photonloom/releases), check it against `SHA256SUMS.txt`, and put `photonloom` on your `PATH`. Running `photonloom` with no arguments (or double-clicking it) opens the studio in your browser.
+- **From source**: install the [build prerequisites](#-build-prerequisites--licensing), then `cargo install --path .`; or run `cargo run --release -- <args>` anywhere this README says `photonloom <args>`.
+- **Container**: `ghcr.io/supernovae/photonloom:latest` (see [Docker & K8s](#-container--kubernetes-deployment)).
+
+> `inspect`, `watch`, `serve --watch`, `serve --gallery`, and the live Activity console arrived in **v0.2.0**. Release binaries ≤ v0.1.1 do not include them.
+
 ### 1. Try Immediately (Zero External Dataset Required)
 
 You can exercise Photonloom right after cloning using either the bundled **16-bit linear-light RGB TIFF** (`docs/assets/example-ctb1-hoo-rgb16.tiff`) or the deterministic **synthetic multi-filter observation generator** (`make_fixture`):
@@ -106,6 +124,7 @@ cargo run --release --
 
 # Option A: Run Magic View directly on the bundled 16-bit linear-light CTB 1 TIFF
 cargo run --release -- magic view docs/assets/example-ctb1-hoo-rgb16.tiff \
+  --output /tmp/photonloom-ctb1-magic \
   --transfer linear \
   --variant enhanced --strength 0.5
 
@@ -123,7 +142,7 @@ cargo run --release -- serve --gallery /tmp/photonloom-gallery --open
 
 ### 2. Process Your Own Observations
 
-Point `photonloom inspect` at your night's folder for a quick, metadata-only plan, then `photonloom run` for full processing. The folder may contain light frames and optional calibration frames:
+Point `photonloom inspect` at your night's folder for a quick, metadata-only plan (frames, integration time, calibration coverage, feasible palettes), then `photonloom run` for full processing. The CLI prints live progress (`[ 42% 03:15] Calibrating M31 · Ha (12/40) — ETA 1m 05s`) with indented measurement lines such as per-filter FWHM, rejected frames with reasons, and registration RMS:
 
 ```bash
 photonloom inspect /path/to/observations
@@ -138,6 +157,22 @@ photonloom run /path/to/observations \
 # Open the completed gallery in the local web app without reprocessing
 photonloom serve --gallery /path/to/gallery --open
 ```
+
+#### Organizing the observation folder
+
+Any layout works as long as each frame's role and filter can be determined. The scanner walks the folder recursively and reads FITS `IMAGETYP`/`FRAME` and `FILTER` headers, folder names, and filename tokens. If these sources disagree, the scan stops with an error instead of guessing. Files with no role default to **light** frames. A layout that is easy to grow night by night:
+
+```text
+observations/                  # point run / inspect / watch here
+├── 2026-10-14/lights/Ha/      # role from folder (lights, darks, bias|offset, flats, flatdarks|darkflats)
+├── 2026-10-14/lights/OIII/    # filter from header or folder (Ha, OIII|O3, SII|S2, L, R, G, B, RGB|OSC)
+├── 2026-10-15/lights/Ha/
+├── calibration/darks/         # reused for every night that matches gain, temperature (±2 °C), and exposure (±5 %)
+├── calibration/bias/
+└── calibration/flats/Ha/      # flats match per filter and sensor geometry
+```
+
+Calibration frames anywhere under the input folder are matched to lights by sensor, geometry, binning, gain/ISO, temperature, and exposure. Use raw calibration subs: prebuilt masters (e.g. `master_dark.fits`) get no special handling and are combined like a single sub of whatever role their header, folder, or filename indicates. Run `photonloom inspect` after reorganizing to confirm what was detected and which calibration is missing.
 
 ### 3. Let a Folder Run Overnight
 
@@ -160,21 +195,21 @@ Re-finish an existing gallery from its stored 32-bit float FITS integrations wit
 
 ```bash
 # Apply a parametric display preset and curve overrides
-cargo run --release -- finish /path/to/gallery \
+photonloom finish /path/to/gallery \
   --finish-preset dark-nebula --exposure 0.25 --saturation 1.12
 
 # Render a starless nebula variant (or screen-blended star reduction) with GPU offloading
-cargo run --release -- finish /path/to/gallery --starless
-cargo run --release -- finish /path/to/gallery --star-mode reduced --star-blend 0.45
+photonloom finish /path/to/gallery --starless
+photonloom finish /path/to/gallery --star-mode reduced --star-blend 0.45
 
 # Render a custom linear channel mix
-cargo run --release -- run /path/to/observations \
+photonloom run /path/to/observations \
   --output /path/to/custom-gallery \
   --mix 'Ha:1,Ha:0.7+OIII:0.3,OIII:1'
 
 # Apply a deterministic natural-language edit (including starless / star reduction) without restacking
-cargo run --release -- edit /path/to/gallery "make the HOO image warmer and brighter"
-cargo run --release -- edit /path/to/gallery "make the SHO image starless"
+photonloom edit /path/to/gallery "make the HOO image warmer and brighter"
+photonloom edit /path/to/gallery "make the SHO image starless"
 ```
 
 | Finish Control | Flag | Range | Notes |
@@ -192,20 +227,20 @@ cargo run --release -- edit /path/to/gallery "make the SHO image starless"
 
 ## 🪄 Magic View (Adaptive Measured Finishing)
 
-**Magic View** is an opt-in, non-generative finishing engine for one-shot runs (and is on by default in watch). It measures sky background MAD/high-frequency noise, stellar PSF profiles (FWHM & eccentricity), multiscale structure contrast, and chroma separation to propose three independent candidates: **Natural** ($0.30\times$), **Enhanced** ($0.65\times$), and **Dramatic** ($1.00\times$). `photonloom magic view INPUT` no longer requires `--output`: for a gallery directory, results go in that directory; for a file, they go in `<file-parent>/<file-stem>-magic`. Pass `--output DIR` to override.
+**Magic View** is a non-generative finishing engine. It is opt-in for `run` (`--magic-view`) and on by default for `watch` / `serve --watch`. It measures sky background MAD/high-frequency noise, stellar PSF profiles (FWHM & eccentricity), multiscale structure contrast, and chroma separation, then proposes three independent candidates: **Natural** ($0.30\times$), **Enhanced** ($0.65\times$), and **Dramatic** ($1.00\times$). `--output` is optional. For a gallery directory, results go into that gallery (under `magic/`); for a single file, they go into `<file-parent>/<file-stem>-magic`. The CLI and the studio both stream the measurements, the optimizer summary per candidate, quality-gate backoffs, and full-resolution tile progress.
 
 ```bash
-# Analyze a gallery target and render three previews + a full-resolution Enhanced output
+# Analyze a gallery target and render three previews + a full-resolution Enhanced output (written into the gallery)
 photonloom magic view /path/to/gallery \
-  --output /path/to/magic-out \
   --palette hoo --variant enhanced --strength 0.5
 
-# Analyze and render a starless nebula Magic View interpretation with GPU offloading
+# Analyze and render a starless nebula Magic View interpretation into a separate directory
 photonloom magic view /path/to/gallery \
   --output /path/to/magic-starless \
   --palette hoo --variant enhanced --strength 0.5 --starless
+
 # Render another variant/strength from an existing session
-photonloom magic render /path/to/magic-out/magic/<digest>/<target>/session.json \
+photonloom magic render /path/to/gallery/magic/<digest>/<target>/session.json \
   --variant dramatic --strength 0.5
 
 # Replay a versioned parameter proposal exported from the Web Studio
@@ -249,7 +284,9 @@ Each run writes into an isolated `<OUTPUT>/runs/<run-id>/` directory and atomica
 <OUTPUT>/
 ├── index.html                                  # Offline static gallery linking to the latest run
 ├── manifest.json                               # Root GalleryManifest JSON with full frame provenance
-└── runs/
+├── .photonloom-watch.json                      # watch / serve --watch only: last processed snapshot + result
+├── magic/<digest>/<target>/                    # Magic View sessions, previews, and full renders
+└── runs/                                       # watch prunes to --keep-runs (default 3), never the active run
     └── run-<timestamp>-<pid>/
         ├── index.html
         ├── manifest.json
